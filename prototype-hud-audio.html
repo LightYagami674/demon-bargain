@@ -1,0 +1,1838 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Demon Bargain — Throwaway Prototype: Mobile HUD, Doom FX &amp; soundEngine</title>
+  <!--
+    THROWAWAY PROTOTYPE (Issue #8):
+    Three structurally different mobile-first HUD variants (A: Top Strip, B: Left Rail, C: Ritual Stage + Thumb Dock),
+    switchable via ?variant=A|B|C and the floating bottom bar, testing 2–6 Doom avatars above a soft keyboard,
+    50%/80% Doom visual degradation vs. chat readability, and portable Web Audio API soundEngine synthesis.
+  -->
+  <style>
+    :root {
+      --bg: #09090d;
+      --surface: #121218;
+      --surface-2: #1a1a24;
+      --border: #282838;
+      --text: #f4f4f7;
+      --muted: #9393a8;
+      --crimson: #e11d48;
+      --crimson-dark: #881337;
+      --crimson-glow: rgba(225, 29, 72, 0.35);
+      --whisper: #a855f7;
+      --whisper-bg: rgba(168, 85, 247, 0.14);
+      --curse: #f59e0b;
+      --curse-bg: rgba(245, 158, 11, 0.14);
+      --safe: #22c55e;
+      --doom: 0;
+      --desat: 0;
+      --vignette-opacity: 0;
+      --eye-opacity: 0;
+      --pulse-ms: 920ms;
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #040406;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+    }
+
+    /* Desktop wrapper: centers a realistic phone viewport, or goes full-bleed on actual phones */
+    .stage-shell {
+      display: flex;
+      height: 100dvh;
+      width: 100vw;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 16px 16px 64px;
+    }
+
+    @media (max-width: 600px) {
+      .stage-shell {
+        padding: 0;
+        display: block;
+      }
+      .phone-bezel {
+        width: 100vw !important;
+        height: 100dvh !important;
+        border-radius: 0 !important;
+        border: none !important;
+        box-shadow: none !important;
+      }
+      .desktop-inspector {
+        display: none !important;
+      }
+      .mobile-inspector-fab {
+        display: flex !important;
+      }
+    }
+
+    .phone-bezel {
+      position: relative;
+      width: 390px;
+      height: min(812px, calc(100dvh - 84px));
+      background: var(--bg);
+      border-radius: 36px;
+      border: 3px solid #262634;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255,255,255,0.05) inset;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: width 0.2s ease, height 0.2s ease;
+    }
+
+    .phone-bezel.compact-se {
+      width: 375px;
+      height: min(667px, calc(100dvh - 84px));
+    }
+
+    /* Visual degradation container */
+    .app-viewport {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      overflow: hidden;
+    }
+
+    /* 50%+ Doom: desaturation applied to atmospheric layers & avatars, keeping chat legible */
+    .app-viewport.doom-50 .degrade-target {
+      filter: saturate(calc(1 - var(--desat)));
+    }
+    .app-viewport.doom-50.full-desat {
+      filter: saturate(calc(1 - var(--desat)));
+    }
+
+    /* Periodic subtle tremor (50%+) and sharper burst (80%+) */
+    @keyframes micro-tremor {
+      0%, 88%, 100% { transform: translate3d(0, 0, 0); }
+      90% { transform: translate3d(-1.2px, 0.8px, 0); }
+      93% { transform: translate3d(1.4px, -0.6px, 0); }
+      96% { transform: translate3d(-0.8px, -0.8px, 0); }
+    }
+    @keyframes heavy-tremor {
+      0%, 78%, 100% { transform: translate3d(0, 0, 0); }
+      81% { transform: translate3d(-2px, 1px, 0); }
+      84% { transform: translate3d(2.2px, -1.2px, 0); }
+      87% { transform: translate3d(-1.6px, 0.8px, 0); }
+      90% { transform: translate3d(1.2px, 1px, 0); }
+      94% { transform: translate3d(-1px, -0.8px, 0); }
+    }
+    @keyframes impact-shake {
+      0%, 100% { transform: translate3d(0, 0, 0); }
+      20% { transform: translate3d(-4px, 2px, 0); }
+      40% { transform: translate3d(4px, -2px, 0); }
+      60% { transform: translate3d(-3px, -1px, 0); }
+      80% { transform: translate3d(2px, 2px, 0); }
+    }
+
+    .app-viewport.doom-50 { animation: micro-tremor 4.2s infinite; }
+    .app-viewport.doom-80 { animation: heavy-tremor 2.4s infinite; }
+    .app-viewport.impact-now { animation: impact-shake 0.35s linear !important; }
+
+    /* 80%+ Doom Overlays: ALWAYS pointer-events: none and center-clear for chat readability */
+    .doom-vignette {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 20;
+      opacity: var(--vignette-opacity);
+      background: radial-gradient(
+        ellipse at center,
+        rgba(0, 0, 0, 0) 42%,
+        rgba(127, 13, 38, 0.42) 78%,
+        rgba(190, 18, 60, 0.82) 100%
+      );
+      transition: opacity 0.35s ease;
+    }
+
+    .app-viewport.doom-80 .doom-vignette {
+      animation: vignette-pulse var(--pulse-ms) ease-in-out infinite;
+    }
+
+    @keyframes vignette-pulse {
+      0%, 100% { opacity: calc(var(--vignette-opacity) * 0.78); }
+      22% { opacity: var(--vignette-opacity); }
+      40% { opacity: calc(var(--vignette-opacity) * 0.92); }
+    }
+
+    .doom-eye-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 15;
+      opacity: var(--eye-opacity);
+      transition: opacity 0.45s ease;
+      mix-blend-mode: screen;
+    }
+
+    /* Static flash overlay */
+    .static-flash {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 30;
+      opacity: 0;
+      background-image: repeating-radial-gradient(circle at 17% 32%, rgba(255,255,255,0.22) 0, rgba(0,0,0,0.4) 2px);
+      background-size: 6px 6px;
+      transition: opacity 0.08s ease;
+    }
+    .static-flash.active { opacity: 0.55; }
+
+    /* Shared HUD Atoms */
+    .hud-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px 8px;
+      background: rgba(14, 14, 20, 0.94);
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+      flex-shrink: 0;
+    }
+
+    .room-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .room-code {
+      color: var(--text);
+      background: var(--surface-2);
+      padding: 2px 6px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+
+    .timer-badge {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 15px;
+      font-weight: 800;
+      color: var(--text);
+      background: #1b1116;
+      border: 1px solid rgba(225, 29, 72, 0.45);
+      padding: 3px 10px;
+      border-radius: 999px;
+      letter-spacing: 0.04em;
+    }
+    .timer-badge.urgent { color: #fda4af; border-color: var(--crimson); }
+
+    .icon-btn {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .icon-btn.muted { color: var(--muted); border-color: #2c2c38; }
+    .icon-btn.unlocked { border-color: rgba(225, 29, 72, 0.55); }
+
+    /* Audio unlock banner (simulates real iOS Safari / Android Chrome first-tap requirement) */
+    .audio-unlock-banner {
+      background: linear-gradient(90deg, #3b0a18, #1e1026);
+      border-bottom: 1px solid rgba(225, 29, 72, 0.4);
+      padding: 7px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      z-index: 12;
+      flex-shrink: 0;
+    }
+    .audio-unlock-banner button {
+      background: var(--crimson);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    /* Active Curse Alert Banner */
+    .curse-alert {
+      background: var(--curse-bg);
+      border-bottom: 1px solid rgba(245, 158, 11, 0.45);
+      padding: 6px 12px;
+      font-size: 12px;
+      color: #fde68a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .curse-word-chip {
+      background: rgba(245, 158, 11, 0.25);
+      border: 1px solid var(--curse);
+      color: #fff;
+      padding: 1px 7px;
+      border-radius: 4px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+
+    /* Chat Feed */
+    .chat-feed {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      scroll-behavior: smooth;
+      position: relative;
+      z-index: 18; /* Above eye canvas so text stays crisp and readable */
+    }
+
+    .msg {
+      max-width: 88%;
+      padding: 8px 10px;
+      border-radius: 12px;
+      font-size: 13.5px;
+      line-height: 1.38;
+      background: rgba(22, 22, 32, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      word-break: break-word;
+    }
+    .msg.mine {
+      align-self: flex-end;
+      background: rgba(34, 24, 38, 0.94);
+      border-color: rgba(225, 29, 72, 0.35);
+    }
+    .msg.entity {
+      align-self: stretch;
+      max-width: 100%;
+      background: rgba(32, 10, 18, 0.94);
+      border: 1px solid rgba(225, 29, 72, 0.55);
+      color: #ffe4e6;
+      font-style: italic;
+    }
+    .msg.whisper {
+      background: rgba(34, 16, 48, 0.94);
+      border: 1px dashed rgba(168, 85, 247, 0.65);
+      color: #f3e8ff;
+    }
+    .msg.intercepted {
+      align-self: stretch;
+      max-width: 100%;
+      background: rgba(58, 12, 30, 0.96);
+      border: 1px solid #f43f5e;
+      color: #fecdd3;
+    }
+    .msg-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 3px;
+    }
+    .msg-delta {
+      font-family: ui-monospace, monospace;
+      font-size: 10.5px;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .msg-delta.up { background: rgba(225,29,72,0.22); color: #fda4af; }
+    .msg-delta.down { background: rgba(34,197,94,0.2); color: #86efac; }
+
+    /* Composer / Input Bar */
+    .composer-wrap {
+      flex-shrink: 0;
+      background: rgba(14, 14, 20, 0.98);
+      border-top: 1px solid var(--border);
+      padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+      z-index: 25;
+    }
+
+    .whisper-pill-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--whisper-bg);
+      border: 1px solid rgba(168, 85, 247, 0.5);
+      color: #e9d5ff;
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 8px;
+      margin-bottom: 6px;
+    }
+    .whisper-pill-bar button {
+      background: none;
+      border: none;
+      color: #e9d5ff;
+      font-weight: 800;
+      cursor: pointer;
+      padding: 0 4px;
+    }
+
+    .composer-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .composer-input {
+      flex: 1;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 9px 11px;
+      font-size: 14px; /* >= 14-16px avoids iOS zoom */
+      outline: none;
+    }
+    .composer-input:focus { border-color: var(--crimson); }
+    .composer-input.whisper-mode { border-color: var(--whisper); background: #1d1429; }
+    .composer-input.curse-mode { border-color: var(--curse); background: #241c0d; }
+
+    .send-btn {
+      background: var(--crimson);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 9px 13px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .send-btn.whisper-mode { background: var(--whisper); }
+    .send-btn.curse-mode { background: var(--curse); color: #140e02; }
+
+    /* Ghost quick-word chips */
+    .curse-chips {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      margin-bottom: 6px;
+      scrollbar-width: none;
+    }
+    .curse-chips::-webkit-scrollbar { display: none; }
+    .curse-chip {
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #fde68a;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    /* Simulated Soft Keyboard (285px typical iOS/Android height) */
+    .soft-keyboard {
+      height: 0;
+      overflow: hidden;
+      background: #1c1c22;
+      border-top: 1px solid #32323e;
+      transition: height 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+      flex-shrink: 0;
+      z-index: 35;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 0 6px;
+    }
+    .soft-keyboard.open {
+      height: 270px;
+      padding: 8px 6px 12px;
+    }
+    .kb-row {
+      display: flex;
+      justify-content: center;
+      gap: 5px;
+    }
+    .kb-key {
+      flex: 1;
+      max-width: 34px;
+      height: 38px;
+      background: #363642;
+      color: #e4e4ec;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 500;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.5);
+      user-select: none;
+    }
+    .kb-key.wide { max-width: none; flex: 3; font-size: 12px; color: var(--muted); }
+    .kb-label {
+      text-align: center;
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    /* ============================================================
+       VARIANT A: TOP STRIP + TAP-TO-WHISPER
+       ============================================================ */
+    .va-roster {
+      display: grid;
+      grid-template-columns: repeat(var(--pcount, 6), minmax(0, 1fr));
+      gap: 4px;
+      padding: 6px 8px;
+      background: rgba(16, 16, 24, 0.94);
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+      flex-shrink: 0;
+    }
+    .va-card {
+      position: relative;
+      background: var(--surface-2);
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 5px 3px 4px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      cursor: pointer;
+      transition: border-color 0.15s, transform 0.12s;
+      overflow: hidden;
+    }
+    .va-card:active { transform: scale(0.95); }
+    .va-card.selected { border-color: var(--whisper); box-shadow: 0 0 0 1px var(--whisper); }
+    .va-card.curse-selected { border-color: var(--curse); box-shadow: 0 0 0 1px var(--curse); }
+    .va-card.is-me { border-color: rgba(225, 29, 72, 0.55); }
+    .va-card.ghost { opacity: 0.45; }
+    .va-avatar { font-size: 18px; line-height: 1; }
+    .va-name {
+      font-size: 10px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+    .va-doom-bar {
+      width: 100%;
+      height: 4px;
+      background: #0c0c12;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .va-doom-fill {
+      height: 100%;
+      transition: width 0.25s ease, background 0.25s ease;
+    }
+    .va-pct {
+      font-family: ui-monospace, monospace;
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    /* ============================================================
+       VARIANT B: LEFT VERTICAL RAIL + MAXIMIZED CHAT
+       ============================================================ */
+    .vb-body {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      overflow: hidden;
+    }
+    .vb-rail {
+      width: 62px;
+      flex-shrink: 0;
+      background: rgba(13, 13, 19, 0.96);
+      border-right: 1px solid var(--border);
+      padding: 6px 4px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 6px;
+      overflow-y: auto;
+      z-index: 12;
+    }
+    .vb-node {
+      width: 52px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 4px 2px;
+      border-radius: 10px;
+      border: 1.5px solid transparent;
+      cursor: pointer;
+      position: relative;
+    }
+    .vb-node.selected { background: var(--whisper-bg); border-color: var(--whisper); }
+    .vb-node.curse-selected { background: var(--curse-bg); border-color: var(--curse); }
+    .vb-node.ghost { opacity: 0.42; }
+    .vb-ring-wrap {
+      position: relative;
+      width: 38px;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .vb-ring-wrap svg {
+      position: absolute;
+      inset: 0;
+      transform: rotate(-90deg);
+    }
+    .vb-emoji { font-size: 16px; position: relative; z-index: 2; }
+    .vb-pct-tag {
+      font-family: ui-monospace, monospace;
+      font-size: 9.5px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .vb-name {
+      font-size: 9.5px;
+      color: var(--muted);
+      max-width: 50px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ============================================================
+       VARIANT C: RITUAL STAGE + THUMB-ZONE ROSTER DOCK
+       ============================================================ */
+    .vc-stage {
+      padding: 8px 12px;
+      background: linear-gradient(180deg, rgba(44, 10, 22, 0.85), rgba(14, 14, 20, 0.94));
+      border-bottom: 1px solid rgba(225, 29, 72, 0.35);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+      z-index: 10;
+      transition: padding 0.2s ease;
+    }
+    .vc-stage.compact {
+      padding: 5px 12px;
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .vc-stage-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+    }
+    .vc-my-meter {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .vc-meter-track {
+      flex: 1;
+      height: 8px;
+      background: #0b0b10;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .vc-meter-fill {
+      height: 100%;
+      transition: width 0.25s ease;
+    }
+    .vc-thumb-dock {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding: 6px 10px;
+      background: rgba(15, 15, 22, 0.96);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+      z-index: 22;
+      scrollbar-width: none;
+    }
+    .vc-thumb-dock::-webkit-scrollbar { display: none; }
+    .vc-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1.5px solid var(--border);
+      font-size: 11.5px;
+      font-weight: 600;
+      white-space: nowrap;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .vc-pill.selected { border-color: var(--whisper); background: var(--whisper-bg); }
+    .vc-pill.curse-selected { border-color: var(--curse); background: var(--curse-bg); }
+    .vc-pill.ghost { opacity: 0.45; }
+
+    /* ============================================================
+       INSPECTOR / SIMULATION PANEL (Desktop side panel + Mobile drawer)
+       ============================================================ */
+    .desktop-inspector {
+      width: 340px;
+      max-height: calc(100dvh - 84px);
+      overflow-y: auto;
+      background: #101016;
+      border: 1px solid #262634;
+      border-radius: 16px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      font-size: 12.5px;
+    }
+    .inspector-title {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #fda4af;
+      margin: 0;
+    }
+    .inspector-sub {
+      font-size: 11.5px;
+      color: var(--muted);
+      margin: 2px 0 0;
+      line-height: 1.4;
+    }
+    .ctrl-group {
+      background: #161620;
+      border: 1px solid #242433;
+      border-radius: 10px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .ctrl-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #d4d4e0;
+    }
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .sim-btn {
+      background: #232332;
+      border: 1px solid #343448;
+      color: var(--text);
+      border-radius: 7px;
+      padding: 5px 9px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .sim-btn:hover { background: #2d2d40; }
+    .sim-btn.active { background: var(--crimson); border-color: var(--crimson); color: #fff; }
+
+    .state-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+    }
+    .state-cell {
+      background: #0d0d13;
+      border: 1px solid #222230;
+      border-radius: 6px;
+      padding: 5px 7px;
+    }
+    .state-cell span { display: block; color: var(--muted); font-size: 9.5px; }
+    .state-cell strong { color: var(--text); }
+
+    /* Mobile inspector toggle button & drawer */
+    .mobile-inspector-fab {
+      display: none;
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 90;
+      background: rgba(24, 24, 34, 0.92);
+      border: 1px solid var(--crimson);
+      color: #fff;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .mobile-drawer {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(4,4,8,0.86);
+      padding: 16px;
+      overflow-y: auto;
+    }
+    .mobile-drawer.open { display: block; }
+
+    /* ============================================================
+       FLOATING VARIANT SWITCHER BAR (per prototype/UI.md)
+       ============================================================ */
+    .proto-switcher {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 80;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: #f8fafc;
+      color: #09090b;
+      padding: 6px 10px;
+      border-radius: 999px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255,255,255,0.2);
+      font-size: 12.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .proto-switcher button {
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      border: none;
+      background: #09090b;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .proto-switcher .v-label {
+      padding: 0 4px;
+      min-width: 175px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <button class="mobile-inspector-fab" id="mobileInspectorBtn">Controls</button>
+
+  <div class="stage-shell">
+    <!-- PHONE VIEWPORT -->
+    <div class="phone-bezel" id="phoneBezel">
+      <div class="app-viewport" id="appViewport">
+        <canvas class="doom-eye-canvas" id="eyeCanvas"></canvas>
+        <div class="doom-vignette"></div>
+        <div class="static-flash" id="staticFlash"></div>
+
+        <!-- Rendered by active variant (A, B, or C) -->
+        <div id="variantMount" style="display:flex; flex-direction:column; flex:1; min-height:0;"></div>
+
+        <!-- Simulated Mobile Soft Keyboard -->
+        <div class="soft-keyboard" id="softKeyboard">
+          <div class="kb-label">Simulated Soft Keyboard (~270px)</div>
+          <div class="kb-row">
+            <div class="kb-key">q</div><div class="kb-key">w</div><div class="kb-key">e</div><div class="kb-key">r</div><div class="kb-key">t</div>
+            <div class="kb-key">y</div><div class="kb-key">u</div><div class="kb-key">i</div><div class="kb-key">o</div><div class="kb-key">p</div>
+          </div>
+          <div class="kb-row">
+            <div class="kb-key">a</div><div class="kb-key">s</div><div class="kb-key">d</div><div class="kb-key">f</div><div class="kb-key">g</div>
+            <div class="kb-key">h</div><div class="kb-key">j</div><div class="kb-key">k</div><div class="kb-key">l</div>
+          </div>
+          <div class="kb-row">
+            <div class="kb-key">⇧</div><div class="kb-key">z</div><div class="kb-key">x</div><div class="kb-key">c</div><div class="kb-key">v</div>
+            <div class="kb-key">b</div><div class="kb-key">n</div><div class="kb-key">m</div><div class="kb-key">⌫</div>
+          </div>
+          <div class="kb-row">
+            <div class="kb-key">123</div><div class="kb-key wide">space</div><div class="kb-key">↵</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DESKTOP INSPECTOR & SIMULATION CONTROLS -->
+    <aside class="desktop-inspector" id="desktopInspector"></aside>
+  </div>
+
+  <!-- MOBILE INSPECTOR DRAWER -->
+  <div class="mobile-drawer" id="mobileDrawer"></div>
+
+  <!-- FLOATING VARIANT SWITCHER -->
+  <nav class="proto-switcher" aria-label="Prototype variant switcher">
+    <button id="prevVariant" title="Previous variant (←)">←</button>
+    <span class="v-label" id="variantLabel">A (Top Strip)</span>
+    <button id="nextVariant" title="Next variant (→)">→</button>
+  </nav>
+
+  <script>
+    /* =========================================================================
+       PORTABLE MODULE: soundEngine.ts (prototype — zero DOM coupling)
+       Directly liftable into src/client/audio/soundEngine.ts
+       ========================================================================= */
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.masterGain = null;
+        this.droneOscA = null;
+        this.droneOscB = null;
+        this.droneGain = null;
+        this.isUnlocked = false;
+        this.isMuted = false;
+        this.doom = 35;
+        this.heartbeatTimer = null;
+        this.lastBeatAt = 0;
+        this.onStateChange = null;
+      }
+
+      getBpm() {
+        // Linear 65 BPM at 0% Doom → 155 BPM at 100% Doom
+        return Math.round(65 + (Math.max(0, Math.min(100, this.doom)) / 100) * 90);
+      }
+
+      getStatus() {
+        return {
+          unlocked: this.isUnlocked,
+          muted: this.isMuted,
+          contextState: this.ctx ? this.ctx.state : 'uninitialized',
+          bpm: this.getBpm(),
+          droneGain: Number(this._targetDroneGain().toFixed(3)),
+        };
+      }
+
+      _notify() {
+        if (typeof this.onStateChange === 'function') this.onStateChange(this.getStatus());
+      }
+
+      _targetDroneGain() {
+        if (this.isMuted || !this.isUnlocked) return 0;
+        // Subtle 45Hz drone fades in from 20% Doom onward, peaks at 0.22
+        const t = Math.max(0, (this.doom - 20) / 80);
+        return 0.03 + t * 0.19;
+      }
+
+      /**
+       * Must be called inside a user gesture handler (pointerdown/click/keydown)
+       * for reliable iOS Safari & Android Chrome Web Audio unlock.
+       */
+      async unlock() {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return false;
+
+        if (!this.ctx) {
+          this.ctx = new AudioCtx();
+          this.masterGain = this.ctx.createGain();
+          this.masterGain.gain.value = this.isMuted ? 0 : 0.85;
+          this.masterGain.connect(this.ctx.destination);
+          this._setupDrone();
+        }
+
+        if (this.ctx.state === 'suspended') {
+          await this.ctx.resume();
+        }
+
+        // iOS Safari hardware-unlock trick: play a 1-sample silent buffer
+        const silent = this.ctx.createBuffer(1, 1, 22050);
+        const src = this.ctx.createBufferSource();
+        src.buffer = silent;
+        src.connect(this.ctx.destination);
+        src.start(0);
+
+        this.isUnlocked = this.ctx.state === 'running';
+        this._syncDroneGain();
+        this._scheduleHeartbeat();
+        this._notify();
+        return this.isUnlocked;
+      }
+
+      _setupDrone() {
+        const now = this.ctx.currentTime;
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 135;
+
+        this.droneGain = this.ctx.createGain();
+        this.droneGain.gain.setValueAtTime(0.0001, now);
+
+        // 45Hz sub-bass + 45.7Hz detuned triangle for slow unsettling beating + phone-speaker harmonics
+        this.droneOscA = this.ctx.createOscillator();
+        this.droneOscA.type = 'sine';
+        this.droneOscA.frequency.value = 45;
+
+        this.droneOscB = this.ctx.createOscillator();
+        this.droneOscB.type = 'triangle';
+        this.droneOscB.frequency.value = 45.7;
+
+        const subGainB = this.ctx.createGain();
+        subGainB.gain.value = 0.35;
+
+        this.droneOscA.connect(filter);
+        this.droneOscB.connect(subGainB);
+        subGainB.connect(filter);
+        filter.connect(this.droneGain);
+        this.droneGain.connect(this.masterGain);
+
+        this.droneOscA.start(now);
+        this.droneOscB.start(now);
+      }
+
+      _syncDroneGain() {
+        if (!this.ctx || !this.droneGain) return;
+        const now = this.ctx.currentTime;
+        this.droneGain.gain.cancelScheduledValues(now);
+        this.droneGain.gain.setTargetAtTime(this._targetDroneGain(), now, 0.18);
+      }
+
+      setDoom(doomPct) {
+        this.doom = Math.max(0, Math.min(100, doomPct));
+        this._syncDroneGain();
+        this._notify();
+      }
+
+      setMuted(muted) {
+        this.isMuted = Boolean(muted);
+        if (this.ctx && this.masterGain) {
+          this.masterGain.gain.setTargetAtTime(this.isMuted ? 0 : 0.85, this.ctx.currentTime, 0.04);
+        }
+        this._syncDroneGain();
+        this._notify();
+      }
+
+      toggleMute() {
+        this.setMuted(!this.isMuted);
+        return this.isMuted;
+      }
+
+      _playThump(startTime, peakFreq, endFreq, gainPeak) {
+        if (!this.ctx || this.isMuted || !this.isUnlocked) return;
+        const osc = this.ctx.createOscillator();
+        const overtone = this.ctx.createOscillator();
+        const filter = this.ctx.createBiquadFilter();
+        const gain = this.ctx.createGain();
+
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(peakFreq, startTime);
+        osc.frequency.exponentialRampToValueAtTime(endFreq, startTime + 0.11);
+
+        // Soft 2x harmonic so tiny phone speakers still convey the chest thump
+        overtone.type = 'triangle';
+        overtone.frequency.setValueAtTime(peakFreq * 2, startTime);
+        overtone.frequency.exponentialRampToValueAtTime(endFreq * 2, startTime + 0.09);
+
+        const overGain = this.ctx.createGain();
+        overGain.gain.value = 0.22;
+
+        filter.type = 'lowpass';
+        filter.frequency.value = 180;
+
+        gain.gain.setValueAtTime(0.0001, startTime);
+        gain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.16);
+
+        osc.connect(filter);
+        overtone.connect(overGain);
+        overGain.connect(filter);
+        filter.connect(gain);
+        gain.connect(this.masterGain);
+
+        osc.start(startTime);
+        overtone.start(startTime);
+        osc.stop(startTime + 0.18);
+        overtone.stop(startTime + 0.18);
+      }
+
+      _scheduleHeartbeat() {
+        if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+        if (!this.isUnlocked) return;
+
+        const bpm = this.getBpm();
+        const intervalMs = Math.round(60000 / bpm);
+        const intensity = 0.18 + (this.doom / 100) * 0.42;
+
+        if (!this.isMuted && this.ctx && this.ctx.state === 'running') {
+          const now = this.ctx.currentTime + 0.01;
+          // LUB
+          this._playThump(now, 64, 34, intensity);
+          // DUB (tighter gap as BPM climbs)
+          const dubDelay = Math.max(0.11, 0.21 - (this.doom / 100) * 0.08);
+          this._playThump(now + dubDelay, 52, 28, intensity * 0.72);
+          this.lastBeatAt = Date.now();
+        }
+
+        this.heartbeatTimer = setTimeout(() => this._scheduleHeartbeat(), intervalMs);
+      }
+
+      triggerStaticBurst(durationSec = 0.28) {
+        if (!this.ctx || !this.isUnlocked || this.isMuted) return;
+        const sampleRate = this.ctx.sampleRate;
+        const length = Math.floor(sampleRate * durationSec);
+        const buffer = this.ctx.createBuffer(1, length, sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < length; i++) {
+          data[i] = (Math.random() * 2 - 1) * (1 - i / length);
+        }
+
+        const noise = this.ctx.createBufferSource();
+        noise.buffer = buffer;
+
+        const bandpass = this.ctx.createBiquadFilter();
+        bandpass.type = 'bandpass';
+        bandpass.frequency.value = 1850;
+        bandpass.Q.value = 1.4;
+
+        const gain = this.ctx.createGain();
+        const now = this.ctx.currentTime;
+        gain.gain.setValueAtTime(0.001, now);
+        gain.gain.linearRampToValueAtTime(0.32, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + durationSec);
+
+        noise.connect(bandpass);
+        bandpass.connect(gain);
+        gain.connect(this.masterGain);
+        noise.start(now);
+      }
+
+      destroy() {
+        if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+        if (this.ctx) this.ctx.close();
+      }
+    }
+
+    /* =========================================================================
+       PROTOTYPE STATE & MOCK DATA
+       ========================================================================= */
+    const VARIANTS = [
+      { key: 'A', name: 'Top Strip' },
+      { key: 'B', name: 'Left Rail' },
+      { key: 'C', name: 'Ritual Stage + Dock' },
+    ];
+
+    const ALL_PLAYERS = [
+      { id: 'me', name: 'You', avatar: '🕯️', doom: 35, isMe: true, ghost: false },
+      { id: 'p2', name: 'Mina', avatar: '🦊', doom: 62, isMe: false, ghost: false },
+      { id: 'p3', name: 'Devon', avatar: '🦇', doom: 48, isMe: false, ghost: false },
+      { id: 'p4', name: 'Sora', avatar: '🕷️', doom: 81, isMe: false, ghost: false },
+      { id: 'p5', name: 'Kael', avatar: '💀', doom: 28, isMe: false, ghost: false },
+      { id: 'p6', name: 'Vex', avatar: '👁️', doom: 100, isMe: false, ghost: true },
+    ];
+
+    const CURSE_SUGGESTIONS = ['mercy', 'candle', 'blood', 'hollow', 'silence'];
+
+    const state = {
+      variant: new URLSearchParams(location.search).get('variant') || 'A',
+      playerCount: 6,
+      myRole: 'LIVING', // 'LIVING' | 'GHOST'
+      myDoom: 35,
+      softKeyboardOpen: false,
+      phoneSize: '390', // '390' | 'se'
+      desatScope: 'selective', // 'selective' | 'full'
+      whisperTargetId: null,
+      curseTargetId: 'p2',
+      activeCurseWord: 'candle',
+      roundSeconds: 47,
+      draftText: '',
+      messages: [
+        { id: 1, type: 'entity', sender: 'THE ENTITY', text: 'The air tastes of cowardice. Who among you begs loudest?' },
+        { id: 2, type: 'chat', sender: 'Mina', text: 'Sora has been quiet for 20 seconds, take them instead!', delta: -8 },
+        { id: 3, type: 'chat', sender: 'Sora', text: 'I swear I have nothing to hide, Mina is deflecting!', delta: +12 },
+        { id: 4, type: 'mine', sender: 'You', text: 'Look at Devon — not a single plea since the bell rang.', delta: -5 },
+        { id: 5, type: 'whisper', sender: 'Mina → You (Whisper)', text: 'Team up on Sora this round?' },
+        { id: 6, type: 'chat', sender: 'Devon', text: 'Spare me and I will offer Mina next round, I swear it.', delta: +6 },
+      ],
+    };
+
+    if (!VARIANTS.some(v => v.key === state.variant)) state.variant = 'A';
+
+    const soundEngine = new SoundEngine();
+
+    /* =========================================================================
+       CANVAS: 80%+ DOOM DARK EYE OVERLAY (center-clear for chat readability)
+       ========================================================================= */
+    const eyeCanvas = document.getElementById('eyeCanvas');
+    const eyeCtx = eyeCanvas.getContext('2d');
+    let eyePhase = 0;
+
+    function drawEyeLoop() {
+      const rect = eyeCanvas.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        if (eyeCanvas.width !== Math.floor(rect.width) || eyeCanvas.height !== Math.floor(rect.height)) {
+          eyeCanvas.width = Math.floor(rect.width);
+          eyeCanvas.height = Math.floor(rect.height);
+        }
+        const w = eyeCanvas.width;
+        const h = eyeCanvas.height;
+        eyeCtx.clearRect(0, 0, w, h);
+
+        if (state.myDoom >= 80) {
+          eyePhase += 0.025;
+          const cx = w * 0.5;
+          const cy = h * 0.36;
+          const openRatio = 0.52 + Math.sin(eyePhase * 0.7) * 0.12;
+          const eyeW = w * 0.44;
+          const eyeH = eyeW * 0.48 * openRatio;
+
+          eyeCtx.save();
+          // Outer eerie glow
+          const grad = eyeCtx.createRadialGradient(cx, cy, 8, cx, cy, eyeW * 1.15);
+          grad.addColorStop(0, 'rgba(225, 29, 72, 0.24)');
+          grad.addColorStop(0.55, 'rgba(136, 19, 55, 0.10)');
+          grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+          eyeCtx.fillStyle = grad;
+          eyeCtx.fillRect(0, 0, w, h);
+
+          // Almond eye silhouette
+          eyeCtx.beginPath();
+          eyeCtx.moveTo(cx - eyeW, cy);
+          eyeCtx.quadraticCurveTo(cx, cy - eyeH * 1.8, cx + eyeW, cy);
+          eyeCtx.quadraticCurveTo(cx, cy + eyeH * 1.8, cx - eyeW, cy);
+          eyeCtx.closePath();
+          eyeCtx.strokeStyle = 'rgba(244, 63, 94, 0.32)';
+          eyeCtx.lineWidth = 2;
+          eyeCtx.stroke();
+          eyeCtx.fillStyle = 'rgba(20, 4, 10, 0.36)';
+          eyeCtx.fill();
+
+          // Slit pupil drifting slightly
+          const driftX = Math.sin(eyePhase * 1.3) * 8;
+          const driftY = Math.cos(eyePhase * 0.9) * 3;
+          eyeCtx.beginPath();
+          eyeCtx.ellipse(cx + driftX, cy + driftY, 7, Math.max(12, eyeH * 0.85), 0, 0, Math.PI * 2);
+          eyeCtx.fillStyle = 'rgba(225, 29, 72, 0.42)';
+          eyeCtx.fill();
+
+          eyeCtx.beginPath();
+          eyeCtx.ellipse(cx + driftX, cy + driftY, 2.5, Math.max(8, eyeH * 0.65), 0, 0, Math.PI * 2);
+          eyeCtx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+          eyeCtx.fill();
+          eyeCtx.restore();
+        }
+      }
+      requestAnimationFrame(drawEyeLoop);
+    }
+    requestAnimationFrame(drawEyeLoop);
+
+    /* =========================================================================
+       HELPERS
+       ========================================================================= */
+    function getActivePlayers() {
+      const list = ALL_PLAYERS.slice(0, state.playerCount).map(p => ({ ...p }));
+      list[0].doom = state.myDoom;
+      list[0].ghost = state.myRole === 'GHOST';
+      return list;
+    }
+
+    function doomColor(pct) {
+      if (pct >= 80) return '#f43f5e';
+      if (pct >= 50) return '#f59e0b';
+      return '#22c55e';
+    }
+
+    function flashStatic() {
+      const el = document.getElementById('staticFlash');
+      const vp = document.getElementById('appViewport');
+      el.classList.add('active');
+      vp.classList.add('impact-now');
+      soundEngine.triggerStaticBurst(0.28);
+      setTimeout(() => el.classList.remove('active'), 190);
+      setTimeout(() => vp.classList.remove('impact-now'), 380);
+    }
+
+    function syncVisualDegradation() {
+      const vp = document.getElementById('appViewport');
+      const d = state.myDoom;
+      vp.classList.toggle('doom-50', d >= 50 && d < 80);
+      vp.classList.toggle('doom-80', d >= 80);
+      vp.classList.toggle('full-desat', state.desatScope === 'full');
+
+      const desat = d < 50 ? 0 : Math.min(0.78, ((d - 50) / 50) * 0.78);
+      const vignette = d < 50 ? 0 : d < 80 ? 0.22 + ((d - 50) / 30) * 0.25 : 0.62 + ((d - 80) / 20) * 0.35;
+      const eyeOp = d < 80 ? 0 : 0.45 + ((d - 80) / 20) * 0.45;
+      const pulseMs = Math.round(60000 / soundEngine.getBpm());
+
+      document.documentElement.style.setProperty('--doom', d);
+      document.documentElement.style.setProperty('--desat', desat.toFixed(2));
+      document.documentElement.style.setProperty('--vignette-opacity', vignette.toFixed(2));
+      document.documentElement.style.setProperty('--eye-opacity', eyeOp.toFixed(2));
+      document.documentElement.style.setProperty('--pulse-ms', pulseMs + 'ms');
+    }
+
+    function handlePlayerTap(player) {
+      if (player.isMe || player.ghost) return;
+      if (state.myRole === 'GHOST') {
+        state.curseTargetId = player.id;
+      } else {
+        state.whisperTargetId = state.whisperTargetId === player.id ? null : player.id;
+      }
+      renderAll();
+    }
+
+    function handleSendMessage(textOverride) {
+      const input = document.getElementById('chatInput');
+      const raw = (textOverride !== undefined ? textOverride : (input ? input.value : state.draftText)).trim();
+      if (!raw) return;
+
+      const players = getActivePlayers();
+
+      if (state.myRole === 'GHOST') {
+        const target = players.find(p => p.id === state.curseTargetId && !p.ghost) || players.find(p => !p.isMe && !p.ghost);
+        if (!target) return;
+        state.messages.push({
+          id: Date.now(),
+          type: 'entity',
+          sender: 'GHOST CURSE',
+          text: `You cursed ${target.name} with the forbidden word "${raw.toUpperCase()}".`,
+        });
+        soundEngine.triggerStaticBurst(0.16);
+      } else if (state.whisperTargetId) {
+        const target = players.find(p => p.id === state.whisperTargetId);
+        state.messages.push({
+          id: Date.now(),
+          type: 'whisper',
+          sender: `You → ${target ? target.name : 'Player'} (Whisper)`,
+          text: raw,
+        });
+        state.whisperTargetId = null;
+      } else {
+        const delta = Math.random() > 0.45 ? -4 : +6;
+        state.myDoom = Math.max(0, Math.min(100, state.myDoom + delta));
+        soundEngine.setDoom(state.myDoom);
+        state.messages.push({
+          id: Date.now(),
+          type: 'mine',
+          sender: 'You',
+          text: raw,
+          delta,
+        });
+        if (state.activeCurseWord && raw.toLowerCase().includes(state.activeCurseWord.toLowerCase())) {
+          state.activeCurseWord = null;
+        }
+      }
+
+      state.draftText = '';
+      renderAll();
+      scrollChatToBottom();
+    }
+
+    function scrollChatToBottom() {
+      requestAnimationFrame(() => {
+        const feed = document.getElementById('chatFeed');
+        if (feed) feed.scrollTop = feed.scrollHeight;
+      });
+    }
+
+    /* =========================================================================
+       SHARED SUB-TEMPLATES (Header, Unlock Banner, Chat Feed, Composer)
+       ========================================================================= */
+    function renderHeaderHtml(compact = false) {
+      const audio = soundEngine.getStatus();
+      const muteLabel = !audio.unlocked ? '🔇 Unlock' : audio.muted ? '🔇 Muted' : `🔊 ${audio.bpm}`;
+      const mins = Math.floor(state.roundSeconds / 60);
+      const secs = String(state.roundSeconds % 60).padStart(2, '0');
+      return `
+        <header class="hud-header degrade-target">
+          <div class="room-pill">
+            <span class="room-code">KRVX</span>
+            ${compact ? '' : '<span>R2</span>'}
+          </div>
+          <div class="timer-badge ${state.roundSeconds <= 15 ? 'urgent' : ''}">${mins}:${secs}</div>
+          <button class="icon-btn ${audio.muted || !audio.unlocked ? 'muted' : 'unlocked'}" id="audioToggleBtn" title="Toggle or unlock Web Audio">
+            ${muteLabel}
+          </button>
+        </header>
+        ${!audio.unlocked ? `
+          <div class="audio-unlock-banner">
+            <span>Tap to unlock iOS/Android horror audio</span>
+            <button id="unlockAudioBtn">Enable Audio</button>
+          </div>
+        ` : ''}
+        ${state.myRole === 'LIVING' && state.activeCurseWord ? `
+          <div class="curse-alert">
+            <span>👻 Ghost Curse — weave into next plea:</span>
+            <span class="curse-word-chip">${state.activeCurseWord.toUpperCase()}</span>
+          </div>
+        ` : ''}
+      `;
+    }
+
+    function renderChatFeedHtml() {
+      return `
+        <div class="chat-feed" id="chatFeed">
+          ${state.messages.map(m => `
+            <div class="msg ${m.type}">
+              <div class="msg-meta">
+                <span>${m.sender}</span>
+                ${typeof m.delta === 'number' ? `<span class="msg-delta ${m.delta > 0 ? 'up' : 'down'}">${m.delta > 0 ? '+' : ''}${m.delta}% Doom</span>` : ''}
+              </div>
+              <div>${m.text}</div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function renderComposerHtml(players) {
+      if (state.myRole === 'GHOST') {
+        const target = players.find(p => p.id === state.curseTargetId && !p.ghost) || players.find(p => !p.isMe && !p.ghost);
+        return `
+          <div class="composer-wrap">
+            <div class="curse-chips">
+              ${CURSE_SUGGESTIONS.map(w => `<button class="curse-chip" data-curse-word="${w}">+${w}</button>`).join('')}
+            </div>
+            <div class="composer-row">
+              <input id="chatInput" class="composer-input curse-mode" type="text"
+                placeholder="Curse ${target ? target.name : 'target'} with 1 word…"
+                value="${state.draftText.replace(/"/g, '&quot;')}" />
+              <button class="send-btn curse-mode" id="sendBtn">Curse</button>
+            </div>
+          </div>
+        `;
+      }
+
+      const wTarget = players.find(p => p.id === state.whisperTargetId && !p.ghost);
+      return `
+        <div class="composer-wrap">
+          ${wTarget ? `
+            <div class="whisper-pill-bar">
+              <span>🤫 Whispering to ${wTarget.avatar} ${wTarget.name} (risk of Entity leak)</span>
+              <button id="clearWhisperBtn" title="Cancel whisper">✕</button>
+            </div>
+          ` : ''}
+          <div class="composer-row">
+            <input id="chatInput" class="composer-input ${wTarget ? 'whisper-mode' : ''}" type="text"
+              placeholder="${wTarget ? `Whisper to ${wTarget.name}…` : 'Plead for survival (tap an avatar to whisper)…'}"
+              value="${state.draftText.replace(/"/g, '&quot;')}" />
+            <button class="send-btn ${wTarget ? 'whisper-mode' : ''}" id="sendBtn">${wTarget ? 'Whisper' : 'Plead'}</button>
+          </div>
+        </div>
+      `;
+    }
+
+    /* =========================================================================
+       VARIANT A: TOP STRIP + TAP-TO-WHISPER
+       ========================================================================= */
+    function renderVariantA(players) {
+      return `
+        ${renderHeaderHtml(false)}
+        <div class="va-roster degrade-target" style="--pcount: ${players.length};">
+          ${players.map(p => {
+            const isWhisper = state.myRole === 'LIVING' && state.whisperTargetId === p.id;
+            const isCurse = state.myRole === 'GHOST' && state.curseTargetId === p.id;
+            return `
+              <button class="va-card ${p.isMe ? 'is-me' : ''} ${p.ghost ? 'ghost' : ''} ${isWhisper ? 'selected' : ''} ${isCurse ? 'curse-selected' : ''}" data-player-id="${p.id}">
+                <span class="va-avatar">${p.ghost ? '👻' : p.avatar}</span>
+                <span class="va-name">${p.name}</span>
+                <div class="va-doom-bar">
+                  <div class="va-doom-fill" style="width:${p.doom}%; background:${doomColor(p.doom)};"></div>
+                </div>
+                <span class="va-pct" style="color:${doomColor(p.doom)}">${p.ghost ? 'GHOST' : p.doom + '%'}</span>
+              </button>
+            `;
+          }).join('')}
+        </div>
+        ${renderChatFeedHtml()}
+        ${renderComposerHtml(players)}
+      `;
+    }
+
+    /* =========================================================================
+       VARIANT B: LEFT VERTICAL RAIL + MAXIMIZED CHAT
+       ========================================================================= */
+    function renderVariantB(players) {
+      const r = 16;
+      const circ = 2 * Math.PI * r;
+      return `
+        ${renderHeaderHtml(true)}
+        <div class="vb-body">
+          <aside class="vb-rail degrade-target">
+            ${players.map(p => {
+              const offset = circ * (1 - p.doom / 100);
+              const isWhisper = state.myRole === 'LIVING' && state.whisperTargetId === p.id;
+              const isCurse = state.myRole === 'GHOST' && state.curseTargetId === p.id;
+              return `
+                <button class="vb-node ${p.ghost ? 'ghost' : ''} ${isWhisper ? 'selected' : ''} ${isCurse ? 'curse-selected' : ''}" data-player-id="${p.id}" style="background:none;">
+                  <div class="vb-ring-wrap">
+                    <svg width="38" height="38" viewBox="0 0 38 38">
+                      <circle cx="19" cy="19" r="${r}" fill="none" stroke="#242433" stroke-width="3" />
+                      <circle cx="19" cy="19" r="${r}" fill="none" stroke="${doomColor(p.doom)}" stroke-width="3"
+                        stroke-dasharray="${circ}" stroke-dashoffset="${offset}" stroke-linecap="round" />
+                    </svg>
+                    <span class="vb-emoji">${p.ghost ? '👻' : p.avatar}</span>
+                  </div>
+                  <span class="vb-pct-tag" style="color:${doomColor(p.doom)}">${p.ghost ? 'GHOST' : p.doom + '%'}</span>
+                  <span class="vb-name">${p.name}</span>
+                </button>
+              `;
+            }).join('')}
+          </aside>
+          <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+            ${renderChatFeedHtml()}
+          </div>
+        </div>
+        ${renderComposerHtml(players)}
+      `;
+    }
+
+    /* =========================================================================
+       VARIANT C: RITUAL STAGE + THUMB-ZONE ROSTER DOCK
+       ========================================================================= */
+    function renderVariantC(players) {
+      const living = players.filter(p => !p.ghost).sort((a, b) => b.doom - a.doom);
+      const leader = living[0];
+      return `
+        ${renderHeaderHtml(true)}
+        <section class="vc-stage degrade-target ${state.softKeyboardOpen ? 'compact' : ''}">
+          ${state.softKeyboardOpen ? `
+            <span style="font-size:11.5px; font-weight:700; color:#fda4af;">You: ${state.myRole === 'GHOST' ? '👻 GHOST' : state.myDoom + '% Doom'}</span>
+            <span style="font-size:11px; color:var(--muted);">Sacrifice lead: <strong style="color:#fff;">${leader ? leader.name + ' (' + leader.doom + '%)' : '—'}</strong></span>
+          ` : `
+            <div class="vc-stage-top">
+              <span style="color:#fda4af; font-weight:700;">👁️ Entity watches ${leader ? leader.name : 'all'} (${leader ? leader.doom + '%' : '—'})</span>
+              <span style="font-family:ui-monospace,monospace; font-weight:800; color:${doomColor(state.myDoom)};">YOU ${state.myRole === 'GHOST' ? 'GHOST' : state.myDoom + '%'}</span>
+            </div>
+            <div class="vc-my-meter">
+              <div class="vc-meter-track">
+                <div class="vc-meter-fill" style="width:${state.myDoom}%; background:${doomColor(state.myDoom)};"></div>
+              </div>
+            </div>
+          `}
+        </section>
+        ${renderChatFeedHtml()}
+        <div class="vc-thumb-dock degrade-target">
+          ${players.slice().sort((a, b) => b.doom - a.doom).map(p => {
+            const isWhisper = state.myRole === 'LIVING' && state.whisperTargetId === p.id;
+            const isCurse = state.myRole === 'GHOST' && state.curseTargetId === p.id;
+            return `
+              <button class="vc-pill ${p.ghost ? 'ghost' : ''} ${isWhisper ? 'selected' : ''} ${isCurse ? 'curse-selected' : ''}" data-player-id="${p.id}">
+                <span>${p.ghost ? '👻' : p.avatar}</span>
+                <span>${p.name}</span>
+                <span style="font-family:ui-monospace,monospace; color:${doomColor(p.doom)};">${p.ghost ? 'GHOST' : p.doom + '%'}</span>
+              </button>
+            `;
+          }).join('')}
+        </div>
+        ${renderComposerHtml(players)}
+      `;
+    }
+
+    /* =========================================================================
+       INSPECTOR PANEL (Surfaces live state + simulation controls)
+       ========================================================================= */
+    function renderInspectorHtml() {
+      const audio = soundEngine.getStatus();
+      return `
+        <div>
+          <h2 class="inspector-title">Prototype Lab (Issue #8)</h2>
+          <p class="inspector-sub">Stress-test 2–6 players above a soft keyboard, 50%/80% Doom legibility, and native Web Audio synthesis.</p>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-label">
+            <span>My Doom Meter</span>
+            <span style="font-family:ui-monospace,monospace; color:${doomColor(state.myDoom)};">${state.myDoom}%</span>
+          </div>
+          <input type="range" min="0" max="100" value="${state.myDoom}" id="doomSlider" style="width:100%; accent-color:#e11d48;" />
+          <div class="btn-row">
+            <button class="sim-btn ${state.myDoom < 50 ? 'active' : ''}" data-set-doom="25">25% Safe</button>
+            <button class="sim-btn ${state.myDoom >= 50 && state.myDoom < 80 ? 'active' : ''}" data-set-doom="55">55% Desat+Shake</button>
+            <button class="sim-btn ${state.myDoom >= 80 ? 'active' : ''}" data-set-doom="85">85% Eye+Vignette</button>
+            <button class="sim-btn" data-set-doom="96">96% Critical</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-label"><span>Players &amp; Viewport</span></div>
+          <div class="btn-row">
+            ${[2,3,4,5,6].map(n => `<button class="sim-btn ${state.playerCount === n ? 'active' : ''}" data-pcount="${n}">${n}p</button>`).join('')}
+          </div>
+          <div class="btn-row">
+            <button class="sim-btn ${state.softKeyboardOpen ? 'active' : ''}" id="toggleKbBtn">${state.softKeyboardOpen ? '⌨️ Soft Keyboard: OPEN' : '⌨️ Soft Keyboard: Closed'}</button>
+            <button class="sim-btn ${state.phoneSize === 'se' ? 'active' : ''}" id="toggleSizeBtn">${state.phoneSize === 'se' ? '📱 iPhone SE (375×667)' : '📱 Standard (390×812)'}</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-label"><span>Role &amp; Visual Scope</span></div>
+          <div class="btn-row">
+            <button class="sim-btn ${state.myRole === 'LIVING' ? 'active' : ''}" data-role="LIVING">Living Player</button>
+            <button class="sim-btn ${state.myRole === 'GHOST' ? 'active' : ''}" data-role="GHOST">👻 Ghost (Curse UI)</button>
+          </div>
+          <div class="btn-row">
+            <button class="sim-btn ${state.desatScope === 'selective' ? 'active' : ''}" data-desat="selective">Selective Desat (Chat Crisp)</button>
+            <button class="sim-btn ${state.desatScope === 'full' ? 'active' : ''}" data-desat="full">Full-Screen Desat</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-label"><span>Trigger Horror Events &amp; Audio</span></div>
+          <div class="btn-row">
+            <button class="sim-btn" id="simStaticBtn">⚡ Static Burst</button>
+            <button class="sim-btn" id="simLeakBtn">👁️ Intercept Whisper</button>
+            <button class="sim-btn" id="simCurseBtn">👻 Receive Curse</button>
+          </div>
+        </div>
+
+        <div class="ctrl-group">
+          <div class="ctrl-label"><span>Live State &amp; soundEngine.ts</span></div>
+          <div class="state-grid">
+            <div class="state-cell"><span>Variant</span><strong>${state.variant}</strong></div>
+            <div class="state-cell"><span>AudioContext</span><strong>${audio.contextState}</strong></div>
+            <div class="state-cell"><span>Heartbeat BPM</span><strong>${audio.bpm} BPM</strong></div>
+            <div class="state-cell"><span>45Hz Drone Gain</span><strong>${audio.droneGain}</strong></div>
+            <div class="state-cell"><span>Whisper Target</span><strong>${state.whisperTargetId || 'None'}</strong></div>
+            <div class="state-cell"><span>Keyboard</span><strong>${state.softKeyboardOpen ? '270px Open' : 'Closed'}</strong></div>
+          </div>
+        </div>
+      `;
+    }
+
+    /* =========================================================================
+       RENDER & EVENT WIRING
+       ========================================================================= */
+    function renderAll() {
+      const players = getActivePlayers();
+      const mount = document.getElementById('variantMount');
+
+      if (state.variant === 'A') mount.innerHTML = renderVariantA(players);
+      else if (state.variant === 'B') mount.innerHTML = renderVariantB(players);
+      else mount.innerHTML = renderVariantC(players);
+
+      const vMeta = VARIANTS.find(v => v.key === state.variant);
+      document.getElementById('variantLabel').textContent = `${vMeta.key} (${vMeta.name})`;
+      document.getElementById('softKeyboard').classList.toggle('open', state.softKeyboardOpen);
+      document.getElementById('phoneBezel').classList.toggle('compact-se', state.phoneSize === 'se');
+
+      const inspectorHtml = renderInspectorHtml();
+      document.getElementById('desktopInspector').innerHTML = inspectorHtml;
+
+      const mobileDrawer = document.getElementById('mobileDrawer');
+      if (mobileDrawer.classList.contains('open')) {
+        mobileDrawer.innerHTML = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;"><button class="sim-btn" id="closeMobileDrawer">Close ✕</button></div>` + inspectorHtml;
+        document.getElementById('closeMobileDrawer').onclick = () => mobileDrawer.classList.remove('open');
+      }
+
+      syncVisualDegradation();
+      bindDynamicEvents(players);
+    }
+
+    function bindHudOnlyEvents(players) {
+      // Avatar taps
+      document.querySelectorAll('[data-player-id]').forEach(el => {
+        el.onclick = () => {
+          const p = players.find(x => x.id === el.dataset.playerId);
+          if (p) handlePlayerTap(p);
+        };
+      });
+
+      // Audio unlock & mute
+      const unlockBtn = document.getElementById('unlockAudioBtn');
+      if (unlockBtn) unlockBtn.onclick = async () => { await soundEngine.unlock(); renderAll(); };
+
+      const toggleBtn = document.getElementById('audioToggleBtn');
+      if (toggleBtn) {
+        toggleBtn.onclick = async () => {
+          if (!soundEngine.isUnlocked) await soundEngine.unlock();
+          else soundEngine.toggleMute();
+          renderAll();
+        };
+      }
+
+      // Chat composer
+      const input = document.getElementById('chatInput');
+      if (input) {
+        input.oninput = e => { state.draftText = e.target.value; };
+        input.onkeydown = e => { if (e.key === 'Enter') handleSendMessage(); };
+      }
+      const sendBtn = document.getElementById('sendBtn');
+      if (sendBtn) sendBtn.onclick = () => handleSendMessage();
+
+      const clearWhisper = document.getElementById('clearWhisperBtn');
+      if (clearWhisper) clearWhisper.onclick = () => { state.whisperTargetId = null; renderAll(); };
+
+      document.querySelectorAll('[data-curse-word]').forEach(btn => {
+        btn.onclick = () => handleSendMessage(btn.dataset.curseWord);
+      });
+    }
+
+    function bindDynamicEvents(players) {
+      bindHudOnlyEvents(players);
+
+      // Inspector controls (both desktop and mobile drawer)
+      document.querySelectorAll('#doomSlider').forEach(slider => {
+        slider.oninput = e => {
+          state.myDoom = Number(e.target.value);
+          soundEngine.setDoom(state.myDoom);
+          // Update phone HUD + degradation without destroying the active range input mid-drag
+          const activePlayers = getActivePlayers();
+          const mount = document.getElementById('variantMount');
+          if (state.variant === 'A') mount.innerHTML = renderVariantA(activePlayers);
+          else if (state.variant === 'B') mount.innerHTML = renderVariantB(activePlayers);
+          else mount.innerHTML = renderVariantC(activePlayers);
+          syncVisualDegradation();
+          const label = slider.previousElementSibling && slider.previousElementSibling.querySelector('span:last-child');
+          if (label) {
+            label.textContent = state.myDoom + '%';
+            label.style.color = doomColor(state.myDoom);
+          }
+          bindHudOnlyEvents(activePlayers);
+        };
+        slider.onchange = () => renderAll();
+      });
+
+      document.querySelectorAll('[data-set-doom]').forEach(btn => {
+        btn.onclick = () => {
+          state.myDoom = Number(btn.dataset.setDoom);
+          soundEngine.setDoom(state.myDoom);
+          if (state.myDoom >= 80) flashStatic();
+          renderAll();
+        };
+      });
+
+      document.querySelectorAll('[data-pcount]').forEach(btn => {
+        btn.onclick = () => {
+          state.playerCount = Number(btn.dataset.pcount);
+          renderAll();
+        };
+      });
+
+      document.querySelectorAll('#toggleKbBtn').forEach(btn => {
+        btn.onclick = () => {
+          state.softKeyboardOpen = !state.softKeyboardOpen;
+          renderAll();
+          scrollChatToBottom();
+        };
+      });
+
+      document.querySelectorAll('#toggleSizeBtn').forEach(btn => {
+        btn.onclick = () => {
+          state.phoneSize = state.phoneSize === '390' ? 'se' : '390';
+          renderAll();
+        };
+      });
+
+      document.querySelectorAll('[data-role]').forEach(btn => {
+        btn.onclick = () => {
+          state.myRole = btn.dataset.role;
+          state.whisperTargetId = null;
+          renderAll();
+        };
+      });
+
+      document.querySelectorAll('[data-desat]').forEach(btn => {
+        btn.onclick = () => {
+          state.desatScope = btn.dataset.desat;
+          renderAll();
+        };
+      });
+
+      document.querySelectorAll('#simStaticBtn').forEach(btn => {
+        btn.onclick = () => flashStatic();
+      });
+
+      document.querySelectorAll('#simLeakBtn').forEach(btn => {
+        btn.onclick = () => {
+          flashStatic();
+          state.messages.push({
+            id: Date.now(),
+            type: 'intercepted',
+            sender: '👁️ ENTITY INTERCEPTED WHISPER',
+            text: 'Mina whispered to You: "Throw Devon to the fire next." (+14% Doom to Mina)',
+          });
+          renderAll();
+          scrollChatToBottom();
+        };
+      });
+
+      document.querySelectorAll('#simCurseBtn').forEach(btn => {
+        btn.onclick = () => {
+          const word = CURSE_SUGGESTIONS[Math.floor(Math.random() * CURSE_SUGGESTIONS.length)];
+          state.myRole = 'LIVING';
+          state.activeCurseWord = word;
+          flashStatic();
+          renderAll();
+        };
+      });
+    }
+
+    function setVariant(key) {
+      state.variant = key;
+      try {
+        const url = new URL(location.href);
+        url.searchParams.set('variant', key);
+        history.replaceState(null, '', url.toString());
+      } catch (_) {}
+      renderAll();
+    }
+
+    function cycleVariant(delta) {
+      const idx = VARIANTS.findIndex(v => v.key === state.variant);
+      const next = VARIANTS[(idx + delta + VARIANTS.length) % VARIANTS.length];
+      setVariant(next.key);
+    }
+
+    document.getElementById('prevVariant').onclick = () => cycleVariant(-1);
+    document.getElementById('nextVariant').onclick = () => cycleVariant(1);
+
+    document.getElementById('mobileInspectorBtn').onclick = () => {
+      document.getElementById('mobileDrawer').classList.toggle('open');
+      renderAll();
+    };
+
+    // Keyboard ← / → variant switching (ignored when typing in inputs)
+    window.addEventListener('keydown', e => {
+      const tag = (e.target && e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable)) return;
+      if (e.key === 'ArrowLeft') cycleVariant(-1);
+      if (e.key === 'ArrowRight') cycleVariant(1);
+    });
+
+    // Countdown tick for realism
+    setInterval(() => {
+      state.roundSeconds = state.roundSeconds > 0 ? state.roundSeconds - 1 : 60;
+      const badge = document.querySelector('.timer-badge');
+      if (badge) {
+        const m = Math.floor(state.roundSeconds / 60);
+        const s = String(state.roundSeconds % 60).padStart(2, '0');
+        badge.textContent = `${m}:${s}`;
+        badge.classList.toggle('urgent', state.roundSeconds <= 15);
+      }
+    }, 1000);
+
+    renderAll();
+    scrollChatToBottom();
+  </script>
+</body>
+</html>
