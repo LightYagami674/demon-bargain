@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, act, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "./App.js";
@@ -6,6 +6,7 @@ import type { CreateRoomSocket, RoomSocket } from "./socket.js";
 import type { ClientMessage, ServerMessage } from "../shared/protocol.js";
 import { isValidRoomCode } from "../shared/constants.js";
 import {
+  getAudioMuted,
   getPreferredAvatar,
   getPreferredName,
   getRoomToken,
@@ -499,5 +500,433 @@ describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live publ
     expect(
       screen.getByPlaceholderText(/ghost/i),
     ).toBeDisabled();
+  });
+
+  it("applies 50% and 80% Doom visual degradation states and clears them when eliminated", () => {
+    const now = 1_700_000_000_000;
+    setPreferredName("Alice");
+    setRoomToken("ABCD", "tok-alice");
+    window.history.replaceState({}, "", "/room/ABCD");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "ABCD",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 60_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 49,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 30,
+          },
+        ],
+      });
+    });
+
+    const viewport = screen.getByTestId("app-viewport");
+    expect(viewport).not.toHaveClass("doom-50");
+    expect(viewport).not.toHaveClass("doom-80");
+    expect(viewport.style.getPropertyValue("--desat")).toBe("0");
+    expect(viewport.style.getPropertyValue("--vignette-opacity")).toBe("0");
+    expect(viewport.style.getPropertyValue("--eye-opacity")).toBe("0");
+
+    // 50%+ Doom: selective desaturation & micro-tremor, chat stays crisp
+    act(() => {
+      sock.emitServerMessage({
+        type: "player_updated",
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 65,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 30,
+          },
+        ],
+      });
+    });
+
+    expect(viewport).toHaveClass("doom-50");
+    expect(viewport).not.toHaveClass("doom-80");
+    expect(Number(viewport.style.getPropertyValue("--desat"))).toBeCloseTo(0.234, 3);
+    expect(Number(viewport.style.getPropertyValue("--vignette-opacity"))).toBeCloseTo(0.345, 3);
+    expect(viewport.style.getPropertyValue("--eye-opacity")).toBe("0");
+    expect(screen.getByTestId("player-rail")).toHaveClass("degrade-target");
+    expect(screen.getByTestId("chat-feed")).not.toHaveClass("degrade-target");
+
+    // 80%+ Doom: Entity Eye canvas & crimson radial edge vignette activate
+    act(() => {
+      sock.emitServerMessage({
+        type: "player_updated",
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 80,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 30,
+          },
+        ],
+      });
+    });
+
+    expect(viewport).toHaveClass("doom-80");
+    expect(viewport).not.toHaveClass("doom-50");
+    expect(Number(viewport.style.getPropertyValue("--eye-opacity"))).toBeCloseTo(0.45, 3);
+    expect(Number(viewport.style.getPropertyValue("--vignette-opacity"))).toBeCloseTo(0.62, 3);
+    expect(screen.getByTestId("doom-eye-canvas")).toHaveClass("pointer-events-none");
+    expect(screen.getByTestId("doom-vignette")).toHaveClass("pointer-events-none");
+
+    // Eliminated Ghost clears Doom degradation
+    act(() => {
+      sock.emitServerMessage({
+        type: "player_updated",
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: false,
+            doom: 100,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 30,
+          },
+        ],
+      });
+    });
+
+    expect(viewport).not.toHaveClass("doom-50");
+    expect(viewport).not.toHaveClass("doom-80");
+    expect(viewport.style.getPropertyValue("--eye-opacity")).toBe("0");
+    expect(viewport.style.getPropertyValue("--vignette-opacity")).toBe("0");
+  });
+
+  describe("Audio unlock, persistent header mute toggle & static burst triggers", () => {
+    let fakeCtx: {
+      state: AudioContextState;
+      currentTime: number;
+      sampleRate: number;
+      destination: Record<string, never>;
+      resume: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      createGain: ReturnType<typeof vi.fn>;
+      createOscillator: ReturnType<typeof vi.fn>;
+      createBiquadFilter: ReturnType<typeof vi.fn>;
+      createBuffer: ReturnType<typeof vi.fn>;
+      createBufferSource: ReturnType<typeof vi.fn>;
+      filters: Array<{ type: string; frequency: { value: number }; Q: { value: number } }>;
+    };
+
+    beforeEach(() => {
+      const filters: Array<{ type: string; frequency: { value: number }; Q: { value: number } }> = [];
+      fakeCtx = {
+        state: "suspended",
+        currentTime: 1,
+        sampleRate: 44100,
+        destination: {},
+        filters,
+        resume: vi.fn(async () => {
+          fakeCtx.state = "running";
+        }),
+        close: vi.fn(async () => {
+          fakeCtx.state = "closed";
+        }),
+        createGain: vi.fn(() => ({
+          gain: {
+            value: 1,
+            setValueAtTime: vi.fn(),
+            setTargetAtTime: vi.fn(),
+            exponentialRampToValueAtTime: vi.fn(),
+          },
+          connect: vi.fn(),
+        })),
+        createOscillator: vi.fn(() => ({
+          type: "sine",
+          frequency: {
+            value: 440,
+            setValueAtTime: vi.fn(),
+            exponentialRampToValueAtTime: vi.fn(),
+          },
+          connect: vi.fn(),
+          start: vi.fn(),
+          stop: vi.fn(),
+        })),
+        createBiquadFilter: vi.fn(() => {
+          const f = { type: "lowpass", frequency: { value: 350 }, Q: { value: 1 }, connect: vi.fn() };
+          filters.push(f);
+          return f;
+        }),
+        createBuffer: vi.fn((_c: number, length: number) => ({
+          getChannelData: () => new Float32Array(length),
+        })),
+        createBufferSource: vi.fn(() => ({
+          buffer: null,
+          connect: vi.fn(),
+          start: vi.fn(),
+          stop: vi.fn(),
+        })),
+      };
+      vi.stubGlobal(
+        "AudioContext",
+        vi.fn(() => fakeCtx),
+      );
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("unlocks audio on header button gesture, scales BPM display, and persists mute toggle", async () => {
+      const user = userEvent.setup();
+      const now = 1_700_000_000_000;
+      setPreferredName("Alice");
+      setRoomToken("ABCD", "tok-alice");
+      window.history.replaceState({}, "", "/room/ABCD");
+
+      const { unmount } = render(<App createSocket={createSocket} />);
+      const sock = sockets[0]!;
+
+      act(() => {
+        sock.emitOpen();
+        sock.emitServerMessage({
+          type: "room_snapshot",
+          roomCode: "ABCD",
+          phase: "IN_MATCH",
+          matchPhase: "ROUND_ACTIVE",
+          round: 1,
+          totalRounds: 2,
+          selfPlayerId: "p1",
+          playerToken: "tok-alice",
+          serverNow: now,
+          phaseEndsAt: now + 60_000,
+          players: [
+            {
+              id: "p1",
+              name: "Alice",
+              avatarId: "skull",
+              isHost: true,
+              connected: true,
+              joinedAt: now,
+              alive: true,
+              doom: 50,
+            },
+            {
+              id: "p2",
+              name: "Bob",
+              avatarId: "raven",
+              isHost: false,
+              connected: true,
+              joinedAt: now + 100,
+              alive: true,
+              doom: 20,
+            },
+          ],
+        });
+      });
+
+      const audioBtn = screen.getByTestId("audio-toggle-btn");
+      expect(audioBtn).toHaveTextContent(/unlock/i);
+
+      await user.click(audioBtn);
+      expect(fakeCtx.resume).toHaveBeenCalledTimes(1);
+      expect(fakeCtx.createBuffer).toHaveBeenCalledWith(1, 1, 22050);
+      expect(audioBtn).toHaveTextContent("110");
+
+      // Toggle mute on -> persists to localStorage
+      await user.click(audioBtn);
+      expect(audioBtn).toHaveTextContent(/muted/i);
+      expect(getAudioMuted()).toBe(true);
+
+      // Remounting preserves muted preference
+      unmount();
+      render(<App createSocket={createSocket} />);
+      const sock2 = sockets[1]!;
+      act(() => {
+        sock2.emitOpen();
+        sock2.emitServerMessage({
+          type: "room_snapshot",
+          roomCode: "ABCD",
+          phase: "IN_MATCH",
+          matchPhase: "ROUND_ACTIVE",
+          round: 1,
+          totalRounds: 2,
+          selfPlayerId: "p1",
+          playerToken: "tok-alice",
+          serverNow: now,
+          phaseEndsAt: now + 60_000,
+          players: [
+            {
+              id: "p1",
+              name: "Alice",
+              avatarId: "skull",
+              isHost: true,
+              connected: true,
+              joinedAt: now,
+              alive: true,
+              doom: 50,
+            },
+          ],
+        });
+      });
+
+      await user.click(screen.getByTestId("audio-toggle-btn"));
+      expect(screen.getByTestId("audio-toggle-btn")).toHaveTextContent(/muted/i);
+    });
+
+    it("triggers impact shake, static flash, and 1850Hz static burst on Whisper interception, Curse hit, and Doom spike", async () => {
+      const user = userEvent.setup();
+      const now = 1_700_000_000_000;
+      setPreferredName("Alice");
+      setRoomToken("ABCD", "tok-alice");
+      window.history.replaceState({}, "", "/room/ABCD");
+
+      render(<App createSocket={createSocket} />);
+      const sock = sockets[0]!;
+
+      act(() => {
+        sock.emitOpen();
+        sock.emitServerMessage({
+          type: "room_snapshot",
+          roomCode: "ABCD",
+          phase: "IN_MATCH",
+          matchPhase: "ROUND_ACTIVE",
+          round: 1,
+          totalRounds: 2,
+          selfPlayerId: "p1",
+          playerToken: "tok-alice",
+          serverNow: now,
+          phaseEndsAt: now + 60_000,
+          players: [
+            {
+              id: "p1",
+              name: "Alice",
+              avatarId: "skull",
+              isHost: true,
+              connected: true,
+              joinedAt: now,
+              alive: true,
+              doom: 30,
+            },
+          ],
+        });
+      });
+
+      await user.click(screen.getByTestId("audio-toggle-btn"));
+      const countBandpass = () =>
+        fakeCtx.filters.filter(
+          (f) => f.type === "bandpass" && f.frequency.value === 1850 && f.Q.value === 1.4,
+        ).length;
+      expect(countBandpass()).toBe(0);
+
+      // 1. Whisper interception
+      act(() => {
+        sock.emitServerMessage({
+          type: "entity_announcement",
+          id: "e-whisper",
+          beatType: "WHISPER_INTERCEPTED",
+          text: "The Entity intercepted a Whisper!",
+          timestamp: now + 1000,
+        });
+      });
+
+      expect(screen.getByTestId("app-viewport")).toHaveClass("impact-now");
+      expect(screen.getByTestId("static-flash")).toHaveClass("active");
+      expect(countBandpass()).toBe(1);
+
+      // 2. Curse hit
+      act(() => {
+        sock.emitServerMessage({
+          type: "entity_announcement",
+          id: "e-curse",
+          beatType: "CURSE_TRIGGERED",
+          text: "A Ghost Curse seared Alice!",
+          timestamp: now + 2000,
+        });
+      });
+      expect(countBandpass()).toBe(2);
+
+      // 3. Doom spike (+25)
+      act(() => {
+        sock.emitServerMessage({
+          type: "player_updated",
+          players: [
+            {
+              id: "p1",
+              name: "Alice",
+              avatarId: "skull",
+              isHost: true,
+              connected: true,
+              joinedAt: now,
+              alive: true,
+              doom: 55,
+            },
+          ],
+        });
+      });
+      expect(countBandpass()).toBe(3);
+    });
   });
 });

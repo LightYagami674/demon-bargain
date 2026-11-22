@@ -3,6 +3,7 @@ import { PRESET_AVATARS, type PresetAvatarId } from "../shared/constants.js";
 const PREFERRED_NAME_KEY = "demon-bargain:preferred-name";
 const PREFERRED_AVATAR_KEY = "demon-bargain:preferred-avatar";
 const ROOM_TOKEN_PREFIX = "demon-bargain:token:";
+const AUDIO_MUTED_KEY = "demon-bargain:audio-muted";
 
 function safeGet(key: string): string | null {
   try {
@@ -57,4 +58,12 @@ export function setRoomToken(roomCode: string, token: string): void {
 
 export function clearRoomToken(roomCode: string): void {
   safeRemove(`${ROOM_TOKEN_PREFIX}${roomCode.toUpperCase()}`);
+}
+
+export function getAudioMuted(): boolean {
+  return safeGet(AUDIO_MUTED_KEY) === "true";
+}
+
+export function setAudioMuted(muted: boolean): void {
+  safeSet(AUDIO_MUTED_KEY, muted ? "true" : "false");
 }

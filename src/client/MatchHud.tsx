@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   CHAT_COOLDOWN_MS,
   MAX_CHAT_LENGTH,
@@ -14,6 +14,9 @@ import type {
   PublicPlayer,
   RoomPhase,
 } from "../shared/protocol.js";
+import { computeDoomFxVars, drawEntityEyeFrame } from "./doomFx.js";
+import { SoundEngine, type SoundEngineStatus } from "./audio/soundEngine.js";
+import { getAudioMuted, setAudioMuted } from "./storage.js";
 
 const RING_RADIUS = 16;
 const RING_CIRC = 2 * Math.PI * RING_RADIUS;
@@ -83,7 +86,50 @@ export function MatchHud({
   const [draft, setDraft] = useState("");
   const [localCooldownEndsAt, setLocalCooldownEndsAt] = useState<number>(0);
   const [validationNote, setValidationNote] = useState<string | null>(null);
+  const [impactNow, setImpactNow] = useState(false);
+  const [staticFlashActive, setStaticFlashActive] = useState(false);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
+  const eyeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const soundEngineRef = useRef<SoundEngine | null>(null);
+  const prevFeedLenRef = useRef<number>(feed.length);
+  const prevDoomRef = useRef<number | null>(null);
+  const impactTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [audioStatus, setAudioStatus] = useState<SoundEngineStatus>(() => ({
+    unlocked: false,
+    muted: getAudioMuted(),
+    contextState: "uninitialized",
+    bpm: 65,
+    droneGain: 0,
+  }));
+
+  useEffect(() => {
+    const engine = new SoundEngine({
+      initialMuted: getAudioMuted(),
+      onStateChange: (status) => setAudioStatus(status),
+    });
+    soundEngineRef.current = engine;
+
+    const unlockOnGesture = (e: Event) => {
+      if (
+        (e.target as HTMLElement | null)?.closest?.(
+          '[data-testid="audio-toggle-btn"]',
+        )
+      ) {
+        return;
+      }
+      void engine.unlock();
+    };
+    window.addEventListener("pointerdown", unlockOnGesture, { once: true });
+    window.addEventListener("keydown", unlockOnGesture, { once: true });
+
+    return () => {
+      window.removeEventListener("pointerdown", unlockOnGesture);
+      window.removeEventListener("keydown", unlockOnGesture);
+      engine.destroy();
+      soundEngineRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -99,6 +145,107 @@ export function MatchHud({
   const selfPlayer = players.find((p) => p.id === selfPlayerId) ?? null;
   const selfDoom = selfPlayer?.doom ?? 0;
   const isAlive = selfPlayer?.alive ?? false;
+  const effectiveDoom = isAlive ? selfDoom : 0;
+  const bpm = Math.round(65 + (effectiveDoom / 100) * 90);
+  const fx = computeDoomFxVars(effectiveDoom, bpm);
+
+  useEffect(() => {
+    soundEngineRef.current?.setDoom(effectiveDoom);
+  }, [effectiveDoom]);
+
+  const triggerImpact = () => {
+    setImpactNow(true);
+    setStaticFlashActive(true);
+    soundEngineRef.current?.triggerStaticBurst(0.28);
+
+    if (impactTimerRef.current) clearTimeout(impactTimerRef.current);
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+
+    flashTimerRef.current = setTimeout(() => {
+      setStaticFlashActive(false);
+    }, 190);
+    impactTimerRef.current = setTimeout(() => {
+      setImpactNow(false);
+    }, 380);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (impactTimerRef.current) clearTimeout(impactTimerRef.current);
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const prevLen = prevFeedLenRef.current;
+    prevFeedLenRef.current = feed.length;
+    if (feed.length <= prevLen) return;
+
+    const newItems = feed.slice(prevLen);
+    const hasShockBeat = newItems.some(
+      (item) =>
+        item.kind === "entity" &&
+        /whisper|leak|intercept|curse/i.test(item.beatType),
+    );
+    if (hasShockBeat) {
+      triggerImpact();
+    }
+  }, [feed]);
+
+  useEffect(() => {
+    const prevDoom = prevDoomRef.current;
+    prevDoomRef.current = effectiveDoom;
+    if (prevDoom !== null && effectiveDoom - prevDoom >= 15) {
+      triggerImpact();
+    }
+  }, [effectiveDoom]);
+
+  const handleAudioToggle = () => {
+    const engine = soundEngineRef.current;
+    if (!engine) return;
+    if (!engine.getStatus().unlocked) {
+      void engine.unlock();
+      return;
+    }
+    const nextMuted = engine.toggleMute();
+    setAudioMuted(nextMuted);
+  };
+
+  useEffect(() => {
+    const canvas = eyeCanvasRef.current;
+    if (!canvas) return;
+    if (effectiveDoom < 80) {
+      if (canvas.width > 0) {
+        canvas.width = 0;
+      }
+      return;
+    }
+    let ctx: CanvasRenderingContext2D | null = null;
+    try {
+      ctx = canvas.getContext("2d");
+    } catch {
+      ctx = null;
+    }
+    if (!ctx) return;
+
+    let rafId = 0;
+    let eyePhase = 0;
+    const render = () => {
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.floor(rect.width);
+      const h = Math.floor(rect.height);
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      eyePhase += 0.025;
+      drawEntityEyeFrame(ctx, canvas.width, canvas.height, eyePhase);
+      rafId = window.requestAnimationFrame(render);
+    };
+    rafId = window.requestAnimationFrame(render);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [effectiveDoom >= 80]);
+
   const canSpeak =
     phase === "IN_MATCH" && matchPhase === "ROUND_ACTIVE" && isAlive;
 
@@ -149,13 +296,39 @@ export function MatchHud({
     placeholder = "Chat unlocks when the round begins...";
   }
 
+  const fxStyle = {
+    "--doom": String(effectiveDoom),
+    "--desat": String(fx.desat),
+    "--vignette-opacity": String(fx.vignetteOpacity),
+    "--eye-opacity": String(fx.eyeOpacity),
+    "--pulse-ms": `${fx.pulseMs}ms`,
+  } as CSSProperties;
+
   return (
     <div
-      className="app-viewport h-dvh flex flex-col bg-[#09090d] text-[#f4f4f7] overflow-hidden relative"
+      data-testid="app-viewport"
+      className={`app-viewport h-dvh flex flex-col bg-[#09090d] text-[#f4f4f7] overflow-hidden relative ${fx.tierClass} ${impactNow ? "impact-now" : ""}`}
+      style={fxStyle}
       data-doom={selfDoom}
       data-match-phase={matchPhase ?? ""}
       data-alive={isAlive ? "true" : "false"}
     >
+      <canvas
+        ref={eyeCanvasRef}
+        data-testid="doom-eye-canvas"
+        className="doom-eye-canvas pointer-events-none"
+        aria-hidden="true"
+      />
+      <div
+        data-testid="doom-vignette"
+        className="doom-vignette pointer-events-none"
+        aria-hidden="true"
+      />
+      <div
+        data-testid="static-flash"
+        className={`static-flash pointer-events-none ${staticFlashActive ? "active" : ""}`}
+        aria-hidden="true"
+      />
       <header className="hud-header degrade-target shrink-0 z-10 flex items-center justify-between gap-2 px-3 py-2 bg-[#0e0e14]/95 border-b border-[#282838]">
         <div className="flex items-center gap-2">
           <span className="room-pill rounded-lg border border-red-900/70 bg-red-950/50 px-2 py-0.5 font-mono text-xs font-bold tracking-[0.18em] text-red-300">
@@ -180,6 +353,25 @@ export function MatchHud({
         </div>
 
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            data-testid="audio-toggle-btn"
+            onClick={handleAudioToggle}
+            aria-label={
+              !audioStatus.unlocked
+                ? "Unlock audio"
+                : audioStatus.muted
+                  ? "Unmute audio"
+                  : "Mute audio"
+            }
+            className="icon-btn rounded-lg border border-zinc-800 hover:border-rose-700/70 px-2 py-1 font-mono text-[11px] font-semibold text-zinc-300 hover:text-rose-200 transition-colors"
+          >
+            {!audioStatus.unlocked
+              ? "🔇 Unlock"
+              : audioStatus.muted
+                ? "🔇 Muted"
+                : `🔊 ${audioStatus.bpm}`}
+          </button>
           <button
             type="button"
             onClick={onLeave}
