@@ -1,5 +1,6 @@
 import {
   CHAT_COOLDOWN_MS,
+  CLOSEST_CALL_DOOM_THRESHOLD,
   CURSE_COOLDOWN_MS,
   CURSE_FAIL_DOOM_PENALTY,
   IN_MATCH_DISCONNECT_GRACE_MS,
@@ -53,10 +54,14 @@ import {
   type ActiveCurse,
   type ClientMessage,
   type CurseResolutionItem,
+  type EliminationCause,
+  type EliminationEvent,
   type ErrorCode,
   type FeedItem,
   type MatchEndReason,
   type MatchPhase,
+  type PostMatchAward,
+  type PostMatchSummary,
   type PublicPlayer,
   type RoomPhase,
   type ServerMessage,
@@ -106,6 +111,8 @@ interface InternalPlayer {
   cursesReceived: number;
   cursesFailed: number;
   cursesPassed: number;
+  roundPeakDoom: number;
+  peakSurvivedDoom: number;
 }
 
 interface RoundWhisper {
@@ -160,6 +167,8 @@ interface PersistedRoomState {
   whisperFallbackTriggered?: boolean;
   whisperFallbackAt?: number | null;
   lastLeakedWhisper?: LeakedWhisperSummary | null;
+  eliminations?: EliminationEvent[];
+  postMatchClosingBeat?: string | null;
 }
 
 export class RoomCore {
@@ -202,6 +211,8 @@ export class RoomCore {
   private whisperFallbackTriggered = false;
   private whisperFallbackAt: number | null = null;
   private lastLeakedWhisper: LeakedWhisperSummary | null = null;
+  private eliminations: EliminationEvent[] = [];
+  private postMatchClosingBeat: string | null = null;
   private whisperInterceptInFlight = false;
   private connectionToPlayerId = new Map<string, string>();
   private playerIdToConnectionId = new Map<string, string>();
@@ -240,6 +251,8 @@ export class RoomCore {
           cursesReceived: p.cursesReceived ?? 0,
           cursesFailed: p.cursesFailed ?? 0,
           cursesPassed: p.cursesPassed ?? 0,
+          roundPeakDoom: p.roundPeakDoom ?? p.doom,
+          peakSurvivedDoom: p.peakSurvivedDoom ?? 0,
         }));
         this.activeCurses = parsed.activeCurses ?? [];
         this.entityMood = parsed.entityMood ?? "SADIST";
@@ -262,6 +275,8 @@ export class RoomCore {
           parsed.whisperFallbackTriggered ?? false;
         this.whisperFallbackAt = parsed.whisperFallbackAt ?? null;
         this.lastLeakedWhisper = parsed.lastLeakedWhisper ?? null;
+        this.eliminations = parsed.eliminations ?? [];
+        this.postMatchClosingBeat = parsed.postMatchClosingBeat ?? null;
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
@@ -299,6 +314,9 @@ export class RoomCore {
     const player = this.players.find((p) => p.id === playerId);
     if (!player) return;
     player.doom = Math.max(0, Math.min(100, Math.round(doom)));
+    if (player.alive) {
+      player.roundPeakDoom = Math.max(player.roundPeakDoom, player.doom);
+    }
     this.persist();
   }
 
@@ -360,15 +378,20 @@ export class RoomCore {
       case "cast_curse":
         this.handleCastCurse(connectionId, msg.targetPlayerId, msg.word);
         return;
+      case "play_again":
+        this.handlePlayAgain(connectionId);
+        return;
       case "leave_room":
         this.handleLeaveRoom(connectionId);
         return;
-      default:
+      default: {
+        const exhaustive: never = msg;
         this.sendError(
           connectionId,
           "INVALID_PAYLOAD",
-          `Action "${msg.type}" is not available yet.`,
+          `Unsupported action: ${String(exhaustive)}`,
         );
+      }
     }
   }
 
@@ -467,6 +490,7 @@ export class RoomCore {
         p.doom = 100;
         p.alive = false;
         p.disconnectGraceEndsAt = null;
+        this.recordElimination(p, "DISCONNECT");
         if (p.isHost) {
           this.transferHostFrom(p.id);
         }
@@ -630,6 +654,7 @@ export class RoomCore {
       const hint = this.copyEngine.drawMoodHint(this.entityMood);
       for (const p of living) {
         p.doom = softResetDoom(p.doom);
+        p.roundPeakDoom = p.doom;
       }
       for (const p of this.players) {
         p.lastCurseAt = null;
@@ -721,6 +746,8 @@ export class RoomCore {
       cursesReceived: 0,
       cursesFailed: 0,
       cursesPassed: 0,
+      roundPeakDoom: INITIAL_DOOM,
+      peakSurvivedDoom: 0,
     };
 
     this.players.push(player);
@@ -866,6 +893,8 @@ export class RoomCore {
     this.sacrificedPlayerId = null;
     this.winnerId = null;
     this.endReason = null;
+    this.postMatchClosingBeat = null;
+    this.eliminations = [];
     this.feed = [];
     this.copyEngine.reset();
     this.activeCurses = [];
@@ -897,6 +926,8 @@ export class RoomCore {
       p.cursesReceived = 0;
       p.cursesFailed = 0;
       p.cursesPassed = 0;
+      p.roundPeakDoom = INITIAL_DOOM;
+      p.peakSurvivedDoom = 0;
     }
 
     this.persist();
@@ -1409,6 +1440,7 @@ export class RoomCore {
       const oldDoom = sender.doom;
       const newDoom = Math.min(100, oldDoom + WHISPER_INTERCEPT_DOOM_PENALTY);
       sender.doom = newDoom;
+      sender.roundPeakDoom = Math.max(sender.roundPeakDoom, newDoom);
       const doomPayload: ServerMessage = {
         type: "doom_updated",
         updates: [
@@ -1566,6 +1598,7 @@ export class RoomCore {
       const oldDoom = target.doom;
       const newDoom = Math.max(0, Math.min(100, oldDoom + rawDelta));
       target.doom = newDoom;
+      target.roundPeakDoom = Math.max(target.roundPeakDoom, newDoom);
       updates.push({
         playerId,
         doom: newDoom,
@@ -1642,6 +1675,12 @@ export class RoomCore {
     cause: "TIMER" | "SPIKE" | "TIEBREAK",
   ): void {
     victim.alive = false;
+    this.recordElimination(victim, cause);
+    for (const p of this.players) {
+      if (p.alive) {
+        p.peakSurvivedDoom = Math.max(p.peakSurvivedDoom, p.roundPeakDoom);
+      }
+    }
     this.sacrificedPlayerId = victim.id;
     this.isSuddenDeath = false;
     this.nextMoodRotationAt = null;
@@ -1666,6 +1705,7 @@ export class RoomCore {
     for (const p of this.players) {
       if (p.alive && p.doom >= 100) {
         p.doom = SUDDEN_DEATH_CLAMP_DOOM;
+        p.roundPeakDoom = Math.max(p.roundPeakDoom, p.doom);
       }
       p.lastCurseAt = null;
     }
@@ -1726,6 +1766,7 @@ export class RoomCore {
     this.sacrificedPlayerId = null;
     this.winnerId = null;
     this.endReason = "JUDGE_ERROR";
+    this.postMatchClosingBeat = POST_MATCH_JUDGE_ERROR;
     this.roundId = this.generateId();
     this.persist();
     this.rescheduleAlarm();
@@ -1751,6 +1792,7 @@ export class RoomCore {
     if (wasLivingInMatch) {
       player.doom = 100;
       player.alive = false;
+      this.recordElimination(player, "DISCONNECT");
     }
 
     this.connectionToPlayerId.delete(connectionId);
@@ -1782,6 +1824,80 @@ export class RoomCore {
     this.broadcastPlayers();
   }
 
+  private handlePlayAgain(connectionId: string): void {
+    const caller = this.getAuthenticatedPlayer(connectionId);
+    if (!caller) return;
+
+    if (this.phase !== "POST_MATCH") {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Can only play again after a Match ends.",
+      );
+      return;
+    }
+
+    if (!caller.isHost) {
+      this.sendError(
+        connectionId,
+        "NOT_HOST",
+        "Only the Host can start a rematch.",
+      );
+      return;
+    }
+
+    const now = this.clock();
+    this.phase = "WAITING";
+    this.matchPhase = null;
+    this.round = 0;
+    this.totalRounds = 0;
+    this.initialPlayerCount = 0;
+    this.phaseEndsAt = null;
+    this.sacrificedPlayerId = null;
+    this.winnerId = null;
+    this.endReason = null;
+    this.postMatchClosingBeat = null;
+    this.eliminations = [];
+    this.feed = [];
+    this.copyEngine.reset();
+    this.activeCurses = [];
+    this.isSuddenDeath = false;
+    this.roundId = "";
+    this.roundPublicMessages = [];
+    this.roundWhispers = [];
+    this.lastWhisperInterceptAt = null;
+    this.roundWhisperInterceptCount = 0;
+    this.whisperFallbackTriggered = false;
+    this.whisperFallbackAt = null;
+    this.lastSpamMockeryAt = null;
+    this.nextMoodRotationAt = null;
+    this.resolvingCapAt = null;
+    this.lastLeakedWhisper = null;
+    this.lastActivityAt = now;
+
+    for (const p of this.players) {
+      p.alive = true;
+      p.doom = INITIAL_DOOM;
+      p.lastChatAt = null;
+      p.lastWhisperAt = null;
+      p.leakedWhisperCount = 0;
+      p.lastCurseAt = null;
+      p.cursesReceived = 0;
+      p.cursesFailed = 0;
+      p.cursesPassed = 0;
+      p.roundPeakDoom = INITIAL_DOOM;
+      p.peakSurvivedDoom = 0;
+    }
+
+    this.persist();
+    this.rescheduleAlarm();
+    this.broadcastPhaseChanged(now);
+    this.logger.info("rematch_started", {
+      roomCode: this.roomCode,
+      playerCount: this.players.length,
+    });
+  }
+
   private attachConnection(connectionId: string, player: InternalPlayer): void {
     const previousConnId = this.playerIdToConnectionId.get(player.id);
     if (previousConnId && previousConnId !== connectionId) {
@@ -1794,6 +1910,9 @@ export class RoomCore {
   }
 
   private endMatch(living: InternalPlayer[], now: number): void {
+    for (const p of living) {
+      p.peakSurvivedDoom = Math.max(p.peakSurvivedDoom, p.roundPeakDoom);
+    }
     this.phase = "POST_MATCH";
     this.matchPhase = null;
     this.phaseEndsAt = null;
@@ -1805,6 +1924,7 @@ export class RoomCore {
       this.endReason,
       living[0]?.name,
     );
+    this.postMatchClosingBeat = closingText;
     this.persist();
     this.broadcastPhaseChanged(now);
     this.logger.info("match_ended", {
@@ -1850,6 +1970,95 @@ export class RoomCore {
       });
     }
     return this.copyEngine.drawBeat("POST_MATCH_ALL_CLAIMED");
+  }
+
+  private recordElimination(
+    player: InternalPlayer,
+    cause: EliminationCause,
+  ): void {
+    this.eliminations.push({
+      round: Math.max(1, this.round),
+      playerId: player.id,
+      playerName: player.name,
+      avatarId: player.avatarId,
+      cause,
+    });
+  }
+
+  private computePostMatchAwards(): PostMatchAward[] {
+    const awards: PostMatchAward[] = [];
+
+    const closestCandidates = this.players.filter(
+      (p) => p.peakSurvivedDoom >= CLOSEST_CALL_DOOM_THRESHOLD,
+    );
+    if (closestCandidates.length > 0) {
+      closestCandidates.sort((a, b) => {
+        if (b.peakSurvivedDoom !== a.peakSurvivedDoom) {
+          return b.peakSurvivedDoom - a.peakSurvivedDoom;
+        }
+        if (a.alive !== b.alive) {
+          return a.alive ? -1 : 1;
+        }
+        return a.joinedAt - b.joinedAt;
+      });
+      const winner = closestCandidates[0]!;
+      awards.push({
+        id: "closest_call",
+        title: "Closest Call",
+        playerId: winner.id,
+        playerName: winner.name,
+        detail: `${winner.peakSurvivedDoom}% peak Doom`,
+      });
+    }
+
+    const curseCandidates = this.players.filter((p) => p.cursesReceived >= 1);
+    if (curseCandidates.length > 0) {
+      curseCandidates.sort((a, b) => {
+        if (b.cursesReceived !== a.cursesReceived) {
+          return b.cursesReceived - a.cursesReceived;
+        }
+        return a.joinedAt - b.joinedAt;
+      });
+      const magnet = curseCandidates[0]!;
+      awards.push({
+        id: "curse_magnet",
+        title: "Curse Magnet",
+        playerId: magnet.id,
+        playerName: magnet.name,
+        detail: `${magnet.cursesReceived} Curse${magnet.cursesReceived === 1 ? "" : "s"} endured`,
+      });
+    }
+
+    if (this.lastLeakedWhisper !== null) {
+      awards.push({
+        id: "exposed",
+        title: "Exposed",
+        playerId: this.lastLeakedWhisper.senderId,
+        playerName: this.lastLeakedWhisper.senderName,
+        detail: `To ${this.lastLeakedWhisper.targetName}: "${this.lastLeakedWhisper.text}"`,
+      });
+    }
+
+    return awards;
+  }
+
+  private buildPostMatchSummary(): PostMatchSummary | null {
+    if (this.phase !== "POST_MATCH" || !this.endReason) return null;
+    const closingBeat =
+      this.postMatchClosingBeat ??
+      (this.endReason === "JUDGE_ERROR"
+        ? POST_MATCH_JUDGE_ERROR
+        : this.drawPostMatchBeat(
+            this.endReason,
+            this.players.find((p) => p.id === this.winnerId)?.name,
+          ));
+    return {
+      endReason: this.endReason,
+      winnerId: this.winnerId,
+      closingBeat,
+      eliminations: [...this.eliminations],
+      awards: this.computePostMatchAwards(),
+    };
   }
 
   private transferHostFrom(departingPlayerId: string): void {
@@ -1971,6 +2180,7 @@ export class RoomCore {
       sacrificedPlayerId: this.sacrificedPlayerId,
       winnerId: this.winnerId,
       endReason: this.endReason,
+      postMatchSummary: this.buildPostMatchSummary(),
       feed: visibleFeed,
       chatCooldownEndsAt,
       whisperCooldownEndsAt,
@@ -1992,6 +2202,7 @@ export class RoomCore {
       sacrificedPlayerId: this.sacrificedPlayerId,
       winnerId: this.winnerId,
       endReason: this.endReason,
+      postMatchSummary: this.buildPostMatchSummary(),
     };
     this.transport.broadcast(JSON.stringify(payload));
   }
@@ -2147,6 +2358,8 @@ export class RoomCore {
       whisperFallbackTriggered: this.whisperFallbackTriggered,
       whisperFallbackAt: this.whisperFallbackAt,
       lastLeakedWhisper: this.lastLeakedWhisper,
+      eliminations: this.eliminations,
+      postMatchClosingBeat: this.postMatchClosingBeat,
     };
     this.storage.save(JSON.stringify(state));
   }

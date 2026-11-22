@@ -25,6 +25,48 @@ export type MatchEndReason = z.infer<typeof MatchEndReasonSchema>;
 
 export const PresetAvatarIdSchema = z.enum(PRESET_AVATAR_IDS);
 
+export const EliminationCauseSchema = z.enum([
+  "TIMER",
+  "SPIKE",
+  "TIEBREAK",
+  "DISCONNECT",
+]);
+export type EliminationCause = z.infer<typeof EliminationCauseSchema>;
+
+export const EliminationEventSchema = z.object({
+  round: z.number().int().min(1),
+  playerId: z.string(),
+  playerName: z.string(),
+  avatarId: PresetAvatarIdSchema,
+  cause: EliminationCauseSchema,
+});
+export type EliminationEvent = z.infer<typeof EliminationEventSchema>;
+
+export const PostMatchAwardIdSchema = z.enum([
+  "closest_call",
+  "curse_magnet",
+  "exposed",
+]);
+export type PostMatchAwardId = z.infer<typeof PostMatchAwardIdSchema>;
+
+export const PostMatchAwardSchema = z.object({
+  id: PostMatchAwardIdSchema,
+  title: z.string(),
+  playerId: z.string(),
+  playerName: z.string(),
+  detail: z.string(),
+});
+export type PostMatchAward = z.infer<typeof PostMatchAwardSchema>;
+
+export const PostMatchSummarySchema = z.object({
+  endReason: MatchEndReasonSchema,
+  winnerId: z.string().nullable(),
+  closingBeat: z.string(),
+  eliminations: z.array(EliminationEventSchema),
+  awards: z.array(PostMatchAwardSchema),
+});
+export type PostMatchSummary = z.infer<typeof PostMatchSummarySchema>;
+
 export const FeedItemSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("chat"),
@@ -182,6 +224,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     sacrificedPlayerId: z.string().nullable().optional(),
     winnerId: z.string().nullable().optional(),
     endReason: MatchEndReasonSchema.nullable().optional(),
+    postMatchSummary: PostMatchSummarySchema.nullable().optional(),
     feed: z.array(FeedItemSchema).optional(),
     chatCooldownEndsAt: z.number().nullable().optional(),
     whisperCooldownEndsAt: z.number().nullable().optional(),
@@ -204,6 +247,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     sacrificedPlayerId: z.string().nullable().optional(),
     winnerId: z.string().nullable().optional(),
     endReason: MatchEndReasonSchema.nullable().optional(),
+    postMatchSummary: PostMatchSummarySchema.nullable().optional(),
   }),
   z.object({
     type: z.literal("chat_message"),

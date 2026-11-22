@@ -40,6 +40,7 @@ export const WHISPER_INTERCEPT_DOOM_PENALTY = 8;
 
 export const CURSE_COOLDOWN_MS = 15_000;
 export const CURSE_FAIL_DOOM_PENALTY = 12;
+export const CLOSEST_CALL_DOOM_THRESHOLD = 75;
 export const CURSE_SUGGESTIONS = [
   "mercy",
   "candle",

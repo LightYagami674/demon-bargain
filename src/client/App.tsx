@@ -17,11 +17,13 @@ import {
   type FeedItem,
   type MatchEndReason,
   type MatchPhase,
+  type PostMatchSummary,
   type PublicPlayer,
   type RoomPhase,
   type ServerMessage,
 } from "../shared/protocol.js";
 import { MatchHud } from "./MatchHud.js";
+import { PostMatchView } from "./PostMatchView.js";
 import {
   createPartyRoomSocket,
   type CreateRoomSocket,
@@ -66,6 +68,7 @@ interface RoomSnapshotState {
   sacrificedPlayerId: string | null;
   winnerId: string | null;
   endReason: MatchEndReason | null;
+  postMatchSummary: PostMatchSummary | null;
   feed: FeedItem[];
   chatCooldownEndsAt: number | null;
   whisperCooldownEndsAt: number | null;
@@ -378,6 +381,7 @@ function RoomView({
             sacrificedPlayerId: msg.sacrificedPlayerId ?? null,
             winnerId: msg.winnerId ?? null,
             endReason: msg.endReason ?? null,
+            postMatchSummary: msg.postMatchSummary ?? null,
             feed: msg.feed ?? [],
             chatCooldownEndsAt: msg.chatCooldownEndsAt ?? null,
             whisperCooldownEndsAt: msg.whisperCooldownEndsAt ?? null,
@@ -401,6 +405,12 @@ function RoomView({
           setErrorBanner(null);
           setSnapshot((prev) => {
             if (!prev) return prev;
+            const nextFeed =
+              msg.phase === "WAITING"
+                ? []
+                : msg.phase === "POST_MATCH"
+                  ? prev.feed.filter((item) => item.kind !== "whisper")
+                  : prev.feed;
             return {
               ...prev,
               phase: msg.phase,
@@ -413,10 +423,16 @@ function RoomView({
               sacrificedPlayerId: msg.sacrificedPlayerId ?? null,
               winnerId: msg.winnerId ?? null,
               endReason: msg.endReason ?? null,
+              postMatchSummary: msg.postMatchSummary ?? null,
+              feed: nextFeed,
+              chatCooldownEndsAt:
+                msg.phase === "WAITING" ? null : prev.chatCooldownEndsAt,
+              whisperCooldownEndsAt:
+                msg.phase === "WAITING" ? null : prev.whisperCooldownEndsAt,
               activeCurses:
                 msg.matchPhase === "ROUND_ACTIVE" ? prev.activeCurses : [],
               curseCooldownEndsAt:
-                msg.matchPhase === "ROUND_INTRO"
+                msg.phase === "WAITING" || msg.matchPhase === "ROUND_INTRO"
                   ? null
                   : prev.curseCooldownEndsAt,
             };
@@ -700,7 +716,24 @@ function RoomView({
     );
   }
 
-  if (snapshot.phase === "IN_MATCH" || snapshot.phase === "POST_MATCH") {
+  if (snapshot.phase === "POST_MATCH") {
+    return (
+      <PostMatchView
+        roomCode={snapshot.roomCode}
+        players={snapshot.players}
+        selfPlayerId={snapshot.selfPlayerId}
+        winnerId={snapshot.winnerId}
+        endReason={snapshot.endReason}
+        postMatchSummary={snapshot.postMatchSummary}
+        feed={snapshot.feed}
+        reconnecting={!socketOpen}
+        onPlayAgain={() => sendMessage({ type: "play_again" })}
+        onLeave={handleLeave}
+      />
+    );
+  }
+
+  if (snapshot.phase === "IN_MATCH") {
     return (
       <MatchHud
         roomCode={snapshot.roomCode}

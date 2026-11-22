@@ -1388,3 +1388,419 @@ describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live publ
     });
   });
 });
+
+describe("SPA Socket Seam — POST_MATCH summary, conditional awards, Match log drawer & Host rematch", () => {
+  let sockets: FakeRoomSocket[];
+  let createSocket: CreateRoomSocket;
+
+  beforeEach(() => {
+    cleanup();
+    window.localStorage.clear();
+    setRoomToken("PQRS", "tok-1");
+    window.history.replaceState({}, "", "/room/PQRS");
+    sockets = [];
+    createSocket = (roomCode) => {
+      const sock = new FakeRoomSocket(roomCode);
+      sockets.push(sock);
+      return sock;
+    };
+  });
+
+  it("renders SURVIVOR summary, elimination timeline, conditional awards, locked chat, and read-only Match log drawer excluding un-leaked whispers", async () => {
+    const user = userEvent.setup();
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+    });
+
+    const now = Date.now();
+    const players = [
+      {
+        id: "p1",
+        name: "Alice",
+        avatarId: "skull" as const,
+        isHost: true,
+        connected: true,
+        joinedAt: now,
+        alive: true,
+        doom: 42,
+      },
+      {
+        id: "p2",
+        name: "Bob",
+        avatarId: "raven" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: now + 100,
+        alive: false,
+        doom: 100,
+      },
+      {
+        id: "p3",
+        name: "Carol",
+        avatarId: "moth" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: now + 200,
+        alive: false,
+        doom: 100,
+      },
+    ];
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "PQRS",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 2,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: now + 30_000,
+        players,
+        feed: [
+          {
+            kind: "chat",
+            id: "f1",
+            playerId: "p1",
+            playerName: "Alice",
+            avatarId: "skull",
+            text: "Spare me, O Entity!",
+            timestamp: now - 5000,
+            doomDelta: -10,
+          },
+          {
+            kind: "whisper",
+            id: "f2",
+            senderId: "p1",
+            senderName: "Alice",
+            senderAvatarId: "skull",
+            targetId: "p2",
+            targetName: "Bob",
+            text: "This secret whisper must never appear in POST_MATCH log",
+            timestamp: now - 4000,
+          },
+          {
+            kind: "whisper_intercepted",
+            id: "f3",
+            whisperId: "w9",
+            senderId: "p2",
+            senderName: "Bob",
+            targetId: "p3",
+            targetName: "Carol",
+            headerText: "Bob's betrayal echoes in the dark.",
+            whisperText: "Vote Alice out next!",
+            timestamp: now - 3000,
+          },
+        ],
+      });
+    });
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "POST_MATCH",
+        matchPhase: null,
+        round: 2,
+        totalRounds: 2,
+        serverNow: now,
+        phaseEndsAt: null,
+        players,
+        winnerId: "p1",
+        endReason: "SURVIVOR",
+        postMatchSummary: {
+          endReason: "SURVIVOR",
+          winnerId: "p1",
+          closingBeat: "Alice walks out through the ash.",
+          eliminations: [
+            {
+              round: 1,
+              playerId: "p3",
+              playerName: "Carol",
+              avatarId: "moth",
+              cause: "TIMER",
+            },
+            {
+              round: 2,
+              playerId: "p2",
+              playerName: "Bob",
+              avatarId: "raven",
+              cause: "SPIKE",
+            },
+          ],
+          awards: [
+            {
+              id: "closest_call",
+              title: "Closest Call",
+              playerId: "p1",
+              playerName: "Alice",
+              detail: "88% peak Doom",
+            },
+            {
+              id: "curse_magnet",
+              title: "Curse Magnet",
+              playerId: "p1",
+              playerName: "Alice",
+              detail: "2 Curses endured",
+            },
+            {
+              id: "exposed",
+              title: "Exposed",
+              playerId: "p2",
+              playerName: "Bob",
+              detail: 'To Carol: "Vote Alice out next!"',
+            },
+          ],
+        },
+      });
+    });
+
+    expect(screen.getByTestId("post-match-screen")).toBeInTheDocument();
+    expect(screen.getByTestId("survivor-spotlight")).toHaveTextContent("Alice");
+    expect(
+      screen.getByText("Alice walks out through the ash."),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("elimination-timeline")).toHaveTextContent("Carol");
+    expect(screen.getByTestId("elimination-timeline")).toHaveTextContent("Bob");
+    expect(screen.getByText("Closest Call")).toBeInTheDocument();
+    expect(screen.getByText("88% peak Doom")).toBeInTheDocument();
+    expect(screen.getByText("Curse Magnet")).toBeInTheDocument();
+    expect(screen.getByText("Exposed")).toBeInTheDocument();
+
+    // Live chat composer is locked / disabled
+    expect(
+      screen.queryByPlaceholderText(/plead for your life/i),
+    ).not.toBeInTheDocument();
+
+    // Open read-only Match Log drawer
+    await user.click(screen.getByRole("button", { name: /view match log/i }));
+    const drawer = screen.getByTestId("match-log-drawer");
+    expect(drawer).toBeInTheDocument();
+    expect(drawer).toHaveTextContent("Spare me, O Entity!");
+    expect(drawer).toHaveTextContent("Vote Alice out next!");
+    expect(drawer).not.toHaveTextContent(
+      "This secret whisper must never appear in POST_MATCH log",
+    );
+
+    // Close drawer
+    await user.click(screen.getByRole("button", { name: /close/i }));
+    expect(screen.queryByTestId("match-log-drawer")).not.toBeInTheDocument();
+  });
+
+  it("renders ALL_CLAIMED and JUDGE_ERROR views and omits untriggered awards", () => {
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+    });
+
+    const now = Date.now();
+    const deadPlayers = [
+      {
+        id: "p1",
+        name: "Alice",
+        avatarId: "skull" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: now,
+        alive: false,
+        doom: 100,
+      },
+      {
+        id: "p2",
+        name: "Bob",
+        avatarId: "raven" as const,
+        isHost: true,
+        connected: true,
+        joinedAt: now + 100,
+        alive: false,
+        doom: 100,
+      },
+    ];
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "PQRS",
+        phase: "POST_MATCH",
+        matchPhase: null,
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: null,
+        players: deadPlayers,
+        winnerId: null,
+        endReason: "ALL_CLAIMED",
+        postMatchSummary: {
+          endReason: "ALL_CLAIMED",
+          winnerId: null,
+          closingBeat: "No soul escaped the chamber.",
+          eliminations: [],
+          awards: [],
+        },
+        feed: [],
+      });
+    });
+
+    expect(screen.getByText(/all souls claimed/i)).toBeInTheDocument();
+    expect(screen.getByText("No soul escaped the chamber.")).toBeInTheDocument();
+    expect(screen.queryByTestId("survivor-spotlight")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("post-match-awards")).not.toBeInTheDocument();
+
+    // JUDGE_ERROR banner
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "POST_MATCH",
+        matchPhase: null,
+        round: 1,
+        totalRounds: 1,
+        serverNow: now,
+        phaseEndsAt: null,
+        players: deadPlayers,
+        winnerId: null,
+        endReason: "JUDGE_ERROR",
+        postMatchSummary: {
+          endReason: "JUDGE_ERROR",
+          winnerId: null,
+          closingBeat: "The Entity fell silent — Match aborted",
+          eliminations: [],
+          awards: [],
+        },
+      });
+    });
+
+    expect(
+      screen.getByText("The Entity fell silent — Match aborted"),
+    ).toBeInTheDocument();
+  });
+
+  it("supports Host Play Again returning to WAITING, non-Host waiting state, and Leave Room returning to landing", async () => {
+    const user = userEvent.setup();
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+    });
+
+    const now = Date.now();
+    const players = [
+      {
+        id: "p1",
+        name: "Alice",
+        avatarId: "skull" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: now,
+        alive: true,
+        doom: 40,
+      },
+      {
+        id: "p2",
+        name: "Bob",
+        avatarId: "raven" as const,
+        isHost: true,
+        connected: true,
+        joinedAt: now + 100,
+        alive: false,
+        doom: 100,
+      },
+    ];
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "PQRS",
+        phase: "POST_MATCH",
+        matchPhase: null,
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: null,
+        players,
+        winnerId: "p1",
+        endReason: "SURVIVOR",
+        postMatchSummary: {
+          endReason: "SURVIVOR",
+          winnerId: "p1",
+          closingBeat: "Alice survived.",
+          eliminations: [],
+          awards: [],
+        },
+        feed: [],
+      });
+    });
+
+    // Non-Host Alice does not see Play Again
+    expect(
+      screen.queryByRole("button", { name: /play again/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/waiting for host to start rematch/i),
+    ).toBeInTheDocument();
+
+    // Host Bob leaves -> Alice becomes Host and sees Play Again
+    act(() => {
+      sock.emitServerMessage({
+        type: "player_updated",
+        players: [{ ...players[0]!, isHost: true }],
+      });
+    });
+
+    const playAgainBtn = screen.getByRole("button", { name: /play again/i });
+    await user.click(playAgainBtn);
+    expect(sock.sent).toContainEqual({ type: "play_again" });
+
+    // Server transitions back to WAITING
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "WAITING",
+        matchPhase: null,
+        round: 0,
+        totalRounds: 0,
+        serverNow: now,
+        phaseEndsAt: null,
+        players: [{ ...players[0]!, isHost: true, alive: true, doom: 50 }],
+        postMatchSummary: null,
+      });
+    });
+
+    expect(screen.queryByTestId("post-match-screen")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /start match/i })).toBeInTheDocument();
+
+    // Leave Room from landing/waiting works; also test Leave Room directly from POST_MATCH
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "POST_MATCH",
+        matchPhase: null,
+        round: 1,
+        totalRounds: 1,
+        serverNow: now,
+        phaseEndsAt: null,
+        players: [{ ...players[0]!, isHost: true }],
+        winnerId: "p1",
+        endReason: "SURVIVOR",
+        postMatchSummary: {
+          endReason: "SURVIVOR",
+          winnerId: "p1",
+          closingBeat: "Alice survived.",
+          eliminations: [],
+          awards: [],
+        },
+      });
+    });
+
+    await user.click(screen.getByRole("button", { name: /leave room/i }));
+    expect(sock.sent).toContainEqual({ type: "leave_room" });
+    expect(screen.getByRole("button", { name: /create room/i })).toBeInTheDocument();
+  });
+});
