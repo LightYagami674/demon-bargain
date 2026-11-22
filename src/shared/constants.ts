@@ -38,6 +38,21 @@ export const WHISPER_INTERCEPT_FALLBACK_REMAINING_MS = 25_000;
 export const WHISPER_INTERCEPT_CANDIDATE_LIMIT = 12;
 export const WHISPER_INTERCEPT_DOOM_PENALTY = 8;
 
+export const CURSE_COOLDOWN_MS = 15_000;
+export const CURSE_FAIL_DOOM_PENALTY = 12;
+export const CURSE_SUGGESTIONS = [
+  "mercy",
+  "candle",
+  "blood",
+  "hollow",
+  "silence",
+] as const;
+export const CURSE_WORD_REGEX = /^(?=.{2,20}$)[a-zA-Z]+(?:[-'][a-zA-Z]+)*$/;
+
+export function isValidCurseWord(word: string): boolean {
+  return CURSE_WORD_REGEX.test(word);
+}
+
 const ROUND_DURATION_BY_LIVING_MS: Record<number, number> = {
   6: 90_000,
   5: 75_000,

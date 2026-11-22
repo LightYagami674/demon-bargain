@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, act, cleanup } from "@testing-library/react";
+import { render, screen, act, cleanup, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "./App.js";
 import type { CreateRoomSocket, RoomSocket } from "./socket.js";
@@ -1230,5 +1230,161 @@ describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live publ
     const bobNode = screen.getByTestId("rail-player-p2");
     await user.click(bobNode);
     expect(screen.queryByTestId("whisper-target-pill")).not.toBeInTheDocument();
+  });
+
+  it("displays active Curse pills for a cursed living player and clears them on curse_resolved", () => {
+    const now = 1_700_000_000_000;
+    setPreferredName("Alice");
+    setRoomToken("ABCD", "tok-alice");
+    window.history.replaceState({}, "", "/room/ABCD");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "ABCD",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 2,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 50_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: false,
+            doom: 100,
+          },
+        ],
+        activeCurses: [],
+      });
+    });
+
+    expect(screen.queryByTestId("active-curses-bar")).not.toBeInTheDocument();
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "curse_applied",
+        curse: {
+          id: "c1",
+          ghostPlayerId: "p2",
+          targetPlayerId: "p1",
+          word: "blood",
+          appliedAt: now + 1000,
+        },
+      });
+    });
+
+    const bar = screen.getByTestId("active-curses-bar");
+    expect(bar).toHaveTextContent("blood");
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "curse_resolved",
+        targetPlayerId: "p1",
+        sourceMessageId: "m1",
+        results: [
+          { curseId: "c1", word: "blood", passed: true, reason: "NATURAL" },
+        ],
+      });
+    });
+
+    expect(screen.queryByTestId("active-curses-bar")).not.toBeInTheDocument();
+  });
+
+  it("switches Ghost composer to Curse mode with left-rail target selection and quick-pick chips", () => {
+    const now = 1_700_000_000_000;
+    setPreferredName("Alice");
+    setRoomToken("ABCD", "tok-alice");
+    window.history.replaceState({}, "", "/room/ABCD");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "ABCD",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 2,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 50_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: false,
+            doom: 100,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 40,
+          },
+        ],
+        activeCurses: [],
+      });
+    });
+
+    const composer = screen.getByTestId("curse-composer");
+    expect(composer).toBeInTheDocument();
+
+    // Select Bob on the left rail
+    fireEvent.click(screen.getByTestId("rail-player-p2"));
+    expect(screen.getByTestId("rail-player-p2")).toHaveClass("curse-selected");
+
+    // Tap quick-pick chip "mercy" and submit
+    fireEvent.click(screen.getByRole("button", { name: "mercy" }));
+    fireEvent.click(screen.getByRole("button", { name: /cast curse/i }));
+
+    expect(sock.sent).toContainEqual({
+      type: "cast_curse",
+      targetPlayerId: "p2",
+      word: "mercy",
+    });
   });
 });

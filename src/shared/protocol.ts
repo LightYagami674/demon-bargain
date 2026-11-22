@@ -94,6 +94,31 @@ export const PublicPlayerSchema = z.object({
 });
 export type PublicPlayer = z.infer<typeof PublicPlayerSchema>;
 
+export const ActiveCurseSchema = z.object({
+  id: z.string(),
+  ghostPlayerId: z.string(),
+  targetPlayerId: z.string(),
+  word: z.string(),
+  appliedAt: z.number(),
+});
+export type ActiveCurse = z.infer<typeof ActiveCurseSchema>;
+
+export const CurseResolutionReasonSchema = z.enum([
+  "NATURAL",
+  "MISSING_WORD",
+  "UNNATURAL",
+  "SPAM",
+]);
+export type CurseResolutionReason = z.infer<typeof CurseResolutionReasonSchema>;
+
+export const CurseResolutionItemSchema = z.object({
+  curseId: z.string(),
+  word: z.string(),
+  passed: z.boolean(),
+  reason: CurseResolutionReasonSchema,
+});
+export type CurseResolutionItem = z.infer<typeof CurseResolutionItemSchema>;
+
 export const DisplayNameSchema = z
   .string()
   .trim()
@@ -160,6 +185,8 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     feed: z.array(FeedItemSchema).optional(),
     chatCooldownEndsAt: z.number().nullable().optional(),
     whisperCooldownEndsAt: z.number().nullable().optional(),
+    activeCurses: z.array(ActiveCurseSchema).optional(),
+    curseCooldownEndsAt: z.number().nullable().optional(),
   }),
   z.object({
     type: z.literal("player_updated"),
@@ -227,6 +254,16 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
       }),
     ),
     sourceMessageId: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("curse_applied"),
+    curse: ActiveCurseSchema,
+  }),
+  z.object({
+    type: z.literal("curse_resolved"),
+    targetPlayerId: z.string(),
+    sourceMessageId: z.string(),
+    results: z.array(CurseResolutionItemSchema),
   }),
   z.object({
     type: z.literal("kicked"),

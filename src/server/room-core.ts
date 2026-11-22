@@ -1,5 +1,7 @@
 import {
   CHAT_COOLDOWN_MS,
+  CURSE_COOLDOWN_MS,
+  CURSE_FAIL_DOOM_PENALTY,
   IN_MATCH_DISCONNECT_GRACE_MS,
   INITIAL_DOOM,
   MAX_CHAT_LENGTH,
@@ -30,6 +32,7 @@ import {
   WHISPER_INTERCEPT_FALLBACK_REMAINING_MS,
   WHISPER_INTERCEPT_MIN_GAP_MS,
   getRoundDurationMs,
+  isValidCurseWord,
   softResetDoom,
   type PresetAvatarId,
 } from "../shared/constants.js";
@@ -47,7 +50,9 @@ import {
 import { POST_MATCH_JUDGE_ERROR } from "./copy/script-bank.js";
 import {
   ClientMessageSchema,
+  type ActiveCurse,
   type ClientMessage,
+  type CurseResolutionItem,
   type ErrorCode,
   type FeedItem,
   type MatchEndReason,
@@ -97,6 +102,10 @@ interface InternalPlayer {
   lastChatAt: number | null;
   lastWhisperAt: number | null;
   leakedWhisperCount: number;
+  lastCurseAt: number | null;
+  cursesReceived: number;
+  cursesFailed: number;
+  cursesPassed: number;
 }
 
 interface RoundWhisper {
@@ -133,6 +142,7 @@ interface PersistedRoomState {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   players: InternalPlayer[];
+  activeCurses?: ActiveCurse[];
   entityMood?: EntityMood;
   previousRoundMood?: EntityMood | null;
   nextMoodRotationAt?: number | null;
@@ -173,6 +183,7 @@ export class RoomCore {
   private endReason: MatchEndReason | null = null;
   private feed: FeedItem[] = [];
   private players: InternalPlayer[] = [];
+  private activeCurses: ActiveCurse[] = [];
   private entityMood: EntityMood = "SADIST";
   private previousRoundMood: EntityMood | null = null;
   private nextMoodRotationAt: number | null = null;
@@ -225,7 +236,12 @@ export class RoomCore {
           lastChatAt: p.lastChatAt ?? null,
           lastWhisperAt: p.lastWhisperAt ?? null,
           leakedWhisperCount: p.leakedWhisperCount ?? 0,
+          lastCurseAt: p.lastCurseAt ?? null,
+          cursesReceived: p.cursesReceived ?? 0,
+          cursesFailed: p.cursesFailed ?? 0,
+          cursesPassed: p.cursesPassed ?? 0,
         }));
+        this.activeCurses = parsed.activeCurses ?? [];
         this.entityMood = parsed.entityMood ?? "SADIST";
         this.previousRoundMood = parsed.previousRoundMood ?? null;
         this.nextMoodRotationAt = parsed.nextMoodRotationAt ?? null;
@@ -340,6 +356,9 @@ export class RoomCore {
         return;
       case "send_whisper":
         this.handleSendWhisper(connectionId, msg.targetPlayerId, msg.text);
+        return;
+      case "cast_curse":
+        this.handleCastCurse(connectionId, msg.targetPlayerId, msg.word);
         return;
       case "leave_room":
         this.handleLeaveRoom(connectionId);
@@ -554,6 +573,7 @@ export class RoomCore {
       this.matchPhase = "ROUND_RESOLVING";
       this.nextMoodRotationAt = null;
       this.whisperFallbackAt = null;
+      this.activeCurses = [];
       const resolvingMs =
         this.pendingEvaluations.size > 0
           ? ROUND_RESOLVING_MAX_MS
@@ -611,6 +631,10 @@ export class RoomCore {
       for (const p of living) {
         p.doom = softResetDoom(p.doom);
       }
+      for (const p of this.players) {
+        p.lastCurseAt = null;
+      }
+      this.activeCurses = [];
       this.matchPhase = "ROUND_INTRO";
       this.phaseEndsAt = now + ROUND_INTRO_MS;
       this.persist();
@@ -693,6 +717,10 @@ export class RoomCore {
       lastChatAt: null,
       lastWhisperAt: null,
       leakedWhisperCount: 0,
+      lastCurseAt: null,
+      cursesReceived: 0,
+      cursesFailed: 0,
+      cursesPassed: 0,
     };
 
     this.players.push(player);
@@ -840,6 +868,7 @@ export class RoomCore {
     this.endReason = null;
     this.feed = [];
     this.copyEngine.reset();
+    this.activeCurses = [];
     this.isSuddenDeath = false;
     this.roundId = this.generateId();
     this.roundPublicMessages = [];
@@ -864,6 +893,10 @@ export class RoomCore {
       p.lastChatAt = null;
       p.lastWhisperAt = null;
       p.leakedWhisperCount = 0;
+      p.lastCurseAt = null;
+      p.cursesReceived = 0;
+      p.cursesFailed = 0;
+      p.cursesPassed = 0;
     }
 
     this.persist();
@@ -876,6 +909,114 @@ export class RoomCore {
       playerCount: this.players.length,
       totalRounds: this.totalRounds,
     });
+  }
+
+  private handleCastCurse(
+    connectionId: string,
+    targetPlayerId: string,
+    rawWord: string,
+  ): void {
+    const ghost = this.getAuthenticatedPlayer(connectionId);
+    if (!ghost) return;
+
+    if (this.phase !== "IN_MATCH" || this.matchPhase !== "ROUND_ACTIVE") {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Curses can only be cast while the round is active.",
+      );
+      return;
+    }
+
+    if (ghost.alive) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Only Ghosts can cast Curses.",
+      );
+      return;
+    }
+
+    const target = this.players.find(
+      (p) => p.id === targetPlayerId && p.alive,
+    );
+    if (!target) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Target must be a living player.",
+      );
+      return;
+    }
+
+    const word = rawWord.trim();
+    if (!isValidCurseWord(word)) {
+      this.sendError(
+        connectionId,
+        "INVALID_CURSE_WORD",
+        "Curse must be a single word (2–20 letters, optional internal hyphen or apostrophe).",
+      );
+      return;
+    }
+
+    const now = this.clock();
+    if (
+      ghost.lastCurseAt !== null &&
+      now - ghost.lastCurseAt < CURSE_COOLDOWN_MS
+    ) {
+      const retryAfterMs = CURSE_COOLDOWN_MS - (now - ghost.lastCurseAt);
+      this.sendError(
+        connectionId,
+        "COOLDOWN_ACTIVE",
+        "Wait before casting another Curse.",
+        retryAfterMs,
+      );
+      return;
+    }
+
+    const normalized = word.toLowerCase();
+    const duplicate = this.activeCurses.some(
+      (c) =>
+        c.targetPlayerId === target.id && c.word.toLowerCase() === normalized,
+    );
+    if (duplicate) {
+      this.sendError(
+        connectionId,
+        "DUPLICATE_CURSE",
+        `${target.name} is already cursed with "${word}".`,
+      );
+      return;
+    }
+
+    const curse: ActiveCurse = {
+      id: this.generateId(),
+      ghostPlayerId: ghost.id,
+      targetPlayerId: target.id,
+      word,
+      appliedAt: now,
+    };
+
+    ghost.lastCurseAt = now;
+    target.cursesReceived += 1;
+    this.activeCurses.push(curse);
+    this.persist();
+
+    this.sendCurseScoped(target.id, {
+      type: "curse_applied",
+      curse,
+    });
+  }
+
+  private sendCurseScoped(targetPlayerId: string, message: ServerMessage): void {
+    const serialized = JSON.stringify(message);
+    for (const p of this.players) {
+      if (!p.connected) continue;
+      if (p.id !== targetPlayerId && p.alive) continue;
+      const connId = this.playerIdToConnectionId.get(p.id);
+      if (connId) {
+        this.transport.send(connId, serialized);
+      }
+    }
   }
 
   private handleSendChat(connectionId: string, rawText: string): void {
@@ -942,6 +1083,16 @@ export class RoomCore {
       text,
       timestamp: now,
     });
+
+    const targetCurses = this.activeCurses.filter(
+      (c) => c.targetPlayerId === player.id,
+    );
+    if (targetCurses.length > 0) {
+      this.activeCurses = this.activeCurses.filter(
+        (c) => c.targetPlayerId !== player.id,
+      );
+    }
+
     this.persist();
 
     const payload: ServerMessage = {
@@ -954,6 +1105,16 @@ export class RoomCore {
       timestamp: now,
     };
     this.transport.broadcast(JSON.stringify(payload));
+
+    const matchedWords: string[] = [];
+    const missingCurseIds = new Set<string>();
+    for (const curse of targetCurses) {
+      if (this.matchesCurseWord(text, curse.word)) {
+        matchedWords.push(curse.word);
+      } else {
+        missingCurseIds.add(curse.id);
+      }
+    }
 
     if (this.jevEvaluator) {
       const roundId = this.roundId;
@@ -969,9 +1130,16 @@ export class RoomCore {
           recentMessages: recentBefore,
           speaker: { id: player.id, name: player.name },
           messageText: text,
+          ...(matchedWords.length > 0 ? { activeCurses: matchedWords } : {}),
         })
         .then((verdict) => {
-          this.applyJudgeVerdict(player.id, id, verdict);
+          this.applyJudgeVerdict(
+            player.id,
+            id,
+            verdict,
+            targetCurses,
+            missingCurseIds,
+          );
         })
         .catch(() => {
           this.handleJudgeFailure(roundId);
@@ -1265,10 +1433,17 @@ export class RoomCore {
     this.rescheduleAlarm();
   }
 
+  private matchesCurseWord(messageText: string, word: string): boolean {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i").test(messageText);
+  }
+
   private applyJudgeVerdict(
     speakerId: string,
     sourceMessageId: string,
     verdict: JudgeMessageResult,
+    evaluatedCurses: ActiveCurse[] = [],
+    missingCurseIds: Set<string> = new Set(),
   ): void {
     if (this.phase !== "IN_MATCH") return;
     if (verdict.roundId !== this.roundId) return;
@@ -1292,8 +1467,9 @@ export class RoomCore {
 
     const deltas = new Map<string, number>();
     let emitSpamMockery = false;
+    const isSpam = verdict.isLowEffortSpamNoul >= 0.7;
 
-    if (verdict.isLowEffortSpamNoul >= 0.7) {
+    if (isSpam) {
       deltas.set(speaker.id, 8);
       if (
         this.lastSpamMockeryAt === null ||
@@ -1332,6 +1508,57 @@ export class RoomCore {
       }
     }
 
+    const curseResultsPayload: CurseResolutionItem[] = [];
+    let cursePassedCount = 0;
+    let curseFailedCount = 0;
+    for (const curse of evaluatedCurses) {
+      if (isSpam) {
+        curseFailedCount += 1;
+        curseResultsPayload.push({
+          curseId: curse.id,
+          word: curse.word,
+          passed: false,
+          reason: "SPAM",
+        });
+      } else if (missingCurseIds.has(curse.id)) {
+        curseFailedCount += 1;
+        curseResultsPayload.push({
+          curseId: curse.id,
+          word: curse.word,
+          passed: false,
+          reason: "MISSING_WORD",
+        });
+      } else if (verdict.curseResults?.[curse.word] === true) {
+        cursePassedCount += 1;
+        curseResultsPayload.push({
+          curseId: curse.id,
+          word: curse.word,
+          passed: true,
+          reason: "NATURAL",
+        });
+      } else {
+        curseFailedCount += 1;
+        curseResultsPayload.push({
+          curseId: curse.id,
+          word: curse.word,
+          passed: false,
+          reason: "UNNATURAL",
+        });
+      }
+    }
+
+    if (curseResultsPayload.length > 0) {
+      speaker.cursesPassed += cursePassedCount;
+      speaker.cursesFailed += curseFailedCount;
+      if (curseFailedCount > 0) {
+        deltas.set(
+          speaker.id,
+          (deltas.get(speaker.id) ?? 0) +
+            curseFailedCount * CURSE_FAIL_DOOM_PENALTY,
+        );
+      }
+    }
+
     const updates: Array<{ playerId: string; doom: number; delta: number }> = [];
     for (const [playerId, rawDelta] of deltas) {
       const target = this.players.find((p) => p.id === playerId && p.alive);
@@ -1366,6 +1593,34 @@ export class RoomCore {
       this.persist();
     }
 
+    if (curseResultsPayload.length > 0) {
+      this.sendCurseScoped(speaker.id, {
+        type: "curse_resolved",
+        targetPlayerId: speaker.id,
+        sourceMessageId,
+        results: curseResultsPayload,
+      });
+
+      const passedWords = curseResultsPayload
+        .filter((r) => r.passed)
+        .map((r) => r.word);
+      const failedWords = curseResultsPayload
+        .filter((r) => !r.passed)
+        .map((r) => r.word);
+      let curseBeatType = "CURSE_MIXED";
+      if (curseFailedCount === 0) {
+        curseBeatType = "CURSE_PASS";
+      } else if (cursePassedCount === 0) {
+        curseBeatType = "CURSE_FAIL";
+      }
+      const curseText = this.drawCurseBeat(
+        speaker.name,
+        passedWords,
+        failedWords,
+      );
+      this.emitEntityAnnouncement(curseBeatType, curseText, now);
+    }
+
     const maxed = this.players.filter((p) => p.alive && p.doom >= 100);
     if (maxed.length === 1) {
       this.sacrificePlayer(maxed[0]!, now, "SPIKE");
@@ -1391,6 +1646,7 @@ export class RoomCore {
     this.isSuddenDeath = false;
     this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
+    this.activeCurses = [];
     this.roundId = this.generateId();
     this.matchPhase = "SACRIFICE_REVEAL";
     this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
@@ -1411,7 +1667,9 @@ export class RoomCore {
       if (p.alive && p.doom >= 100) {
         p.doom = SUDDEN_DEATH_CLAMP_DOOM;
       }
+      p.lastCurseAt = null;
     }
+    this.activeCurses = [];
     this.isSuddenDeath = true;
     this.sacrificedPlayerId = null;
     this.roundId = this.generateId();
@@ -1689,6 +1947,15 @@ export class RoomCore {
       if (this.phase === "POST_MATCH") return false;
       return item.senderId === recipient.id || item.targetId === recipient.id;
     });
+    const curseCooldownEndsAt =
+      !recipient.alive &&
+      recipient.lastCurseAt !== null &&
+      now - recipient.lastCurseAt < CURSE_COOLDOWN_MS
+        ? recipient.lastCurseAt + CURSE_COOLDOWN_MS
+        : null;
+    const visibleCurses = recipient.alive
+      ? this.activeCurses.filter((c) => c.targetPlayerId === recipient.id)
+      : [...this.activeCurses];
     this.send(connectionId, {
       type: "room_snapshot",
       roomCode: this.roomCode,
@@ -1707,6 +1974,8 @@ export class RoomCore {
       feed: visibleFeed,
       chatCooldownEndsAt,
       whisperCooldownEndsAt,
+      activeCurses: visibleCurses,
+      curseCooldownEndsAt,
     });
   }
 
@@ -1860,6 +2129,7 @@ export class RoomCore {
       endReason: this.endReason,
       feed: this.feed,
       players: this.players,
+      activeCurses: this.activeCurses,
       entityMood: this.entityMood,
       previousRoundMood: this.previousRoundMood,
       nextMoodRotationAt: this.nextMoodRotationAt,
