@@ -517,6 +517,7 @@ export function MatchHud({
                   return (
                     <div
                       key={item.id}
+                      data-beat-type={item.beatType}
                       className="msg entity self-stretch rounded-xl border border-rose-600/55 bg-[#200a12]/95 px-3 py-2 text-[13.5px] leading-snug italic text-rose-100"
                     >
                       {item.text}
