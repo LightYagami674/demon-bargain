@@ -1,5 +1,6 @@
 import { Server, type Connection, type WSMessage } from "partyserver";
 import { TypeSafeJevEvaluator } from "./jev.js";
+import { createJsonLogger } from "./logger.js";
 import { RoomCore, type RoomStorage, type RoomTransport } from "./room-core.js";
 
 export interface Env {
@@ -75,12 +76,18 @@ export class Room extends Server<Env> {
       },
     };
 
+    const logger = createJsonLogger();
     const core = new RoomCore({
       roomCode: this.name.toUpperCase(),
       transport,
       storage,
+      logger,
       ...(this.env.TYPESAFE_API_KEY
-        ? { jevEvaluator: new TypeSafeJevEvaluator(this.env.TYPESAFE_API_KEY) }
+        ? {
+            jevEvaluator: new TypeSafeJevEvaluator(this.env.TYPESAFE_API_KEY, {
+              logger,
+            }),
+          }
         : {}),
     });
 
