@@ -64,6 +64,14 @@ export class Room extends Server<Env> {
           void this.ctx.storage.setAlarm(atEpochMs);
         }
       },
+      deleteAll: () => {
+        for (const conn of this.getConnections()) {
+          conn.close(1000, "Room expired");
+        }
+        void this.ctx.storage.deleteAlarm();
+        void this.ctx.storage.deleteAll();
+        this.core = null;
+      },
     };
 
     const core = new RoomCore({
@@ -95,8 +103,8 @@ export class Room extends Server<Env> {
     this.ensureCore().onMessage(connection.id, raw);
   }
 
-  onClose(connection: Connection): void {
-    this.ensureCore().onClose(connection.id);
+  onClose(connection: Connection<ConnectionAttachment>): void {
+    this.ensureCore().onClose(connection.id, connection.state?.playerId);
   }
 
   onAlarm(): void {

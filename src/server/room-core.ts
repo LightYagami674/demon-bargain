@@ -1,5 +1,6 @@
 import {
   CHAT_COOLDOWN_MS,
+  IN_MATCH_DISCONNECT_GRACE_MS,
   INITIAL_DOOM,
   MAX_CHAT_LENGTH,
   MAX_FEED_ITEMS,
@@ -7,6 +8,8 @@ import {
   MIN_CHAT_LENGTH,
   MIN_PLAYERS,
   PRESET_AVATARS,
+  ROOM_EMPTY_CLEANUP_MS,
+  ROOM_IDLE_CLEANUP_MS,
   ROUND_INTRO_MS,
   ROUND_RESOLVING_MS,
   SACRIFICE_REVEAL_MS,
@@ -38,6 +41,7 @@ export interface RoomStorage {
   load(): string | null;
   save(stateJson: string): void;
   scheduleAlarm(atEpochMs: number | null): void;
+  deleteAll(): void;
 }
 
 export interface RoomCoreOptions {
@@ -74,6 +78,8 @@ interface PersistedRoomState {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   players: InternalPlayer[];
+  emptySince?: number | null;
+  lastActivityAt?: number | null;
 }
 
 export class RoomCore {
@@ -94,6 +100,8 @@ export class RoomCore {
   private endReason: MatchEndReason | null = null;
   private feed: FeedItem[] = [];
   private players: InternalPlayer[] = [];
+  private emptySince: number | null = null;
+  private lastActivityAt: number | null = null;
   private connectionToPlayerId = new Map<string, string>();
   private playerIdToConnectionId = new Map<string, string>();
 
@@ -117,11 +125,13 @@ export class RoomCore {
         this.sacrificedPlayerId = parsed.sacrificedPlayerId ?? null;
         this.winnerId = parsed.winnerId ?? null;
         this.endReason = parsed.endReason ?? null;
-        this.feed = parsed.feed ?? [];
+        this.feed = (parsed.feed ?? []).slice(-MAX_FEED_ITEMS);
         this.players = (parsed.players ?? []).map((p) => ({
           ...p,
           lastChatAt: p.lastChatAt ?? null,
         }));
+        this.emptySince = parsed.emptySince ?? null;
+        this.lastActivityAt = parsed.lastActivityAt ?? null;
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
@@ -171,6 +181,7 @@ export class RoomCore {
     }
 
     const msg = result.data;
+    this.lastActivityAt = this.clock();
     switch (msg.type) {
       case "join":
         this.handleJoin(connectionId, msg);
@@ -199,14 +210,16 @@ export class RoomCore {
     }
   }
 
-  onClose(connectionId: string): void {
-    const playerId = this.connectionToPlayerId.get(connectionId);
+  onClose(connectionId: string, fallbackPlayerId?: string): void {
+    const playerId =
+      this.connectionToPlayerId.get(connectionId) ?? fallbackPlayerId;
     if (!playerId) return;
 
     this.connectionToPlayerId.delete(connectionId);
-    if (this.playerIdToConnectionId.get(playerId) === connectionId) {
+    const activeConnId = this.playerIdToConnectionId.get(playerId);
+    if (activeConnId === connectionId) {
       this.playerIdToConnectionId.delete(playerId);
-    } else {
+    } else if (activeConnId !== undefined) {
       // Connection was already superseded by a reconnect
       return;
     }
@@ -214,9 +227,22 @@ export class RoomCore {
     const player = this.players.find((p) => p.id === playerId);
     if (!player) return;
 
+    const now = this.clock();
     player.connected = false;
     if (this.phase === "WAITING" || this.phase === "POST_MATCH") {
-      player.disconnectGraceEndsAt = this.clock() + WAITING_DISCONNECT_GRACE_MS;
+      player.disconnectGraceEndsAt = now + WAITING_DISCONNECT_GRACE_MS;
+    } else if (this.phase === "IN_MATCH") {
+      player.disconnectGraceEndsAt = player.alive
+        ? now + IN_MATCH_DISCONNECT_GRACE_MS
+        : null;
+    }
+
+    if (this.players.every((p) => !p.connected) && this.emptySince === null) {
+      this.emptySince = now;
+    }
+
+    if (this.players.every((p) => !p.connected) && this.emptySince === null) {
+      this.emptySince = this.clock();
     }
 
     this.persist();
@@ -227,6 +253,19 @@ export class RoomCore {
   onAlarm(): void {
     const now = this.clock();
     let changed = false;
+
+    const emptyExpired =
+      this.emptySince !== null &&
+      this.emptySince + ROOM_EMPTY_CLEANUP_MS <= now;
+    const idleExpired =
+      (this.phase === "WAITING" || this.phase === "POST_MATCH") &&
+      this.lastActivityAt !== null &&
+      this.lastActivityAt + ROOM_IDLE_CLEANUP_MS <= now;
+
+    if (emptyExpired || idleExpired) {
+      this.wipeRoom();
+      return;
+    }
 
     if (this.phase === "WAITING" || this.phase === "POST_MATCH") {
       const expired = this.players.filter(
@@ -243,12 +282,44 @@ export class RoomCore {
         this.persist();
         this.broadcastPlayers();
       }
-    } else if (
-      this.phase === "IN_MATCH" &&
-      this.phaseEndsAt !== null &&
-      now >= this.phaseEndsAt
-    ) {
-      this.advanceMatchPhase(now);
+    } else if (this.phase === "IN_MATCH") {
+      const expired = this.players.filter(
+        (p) =>
+          !p.connected &&
+          p.alive &&
+          p.disconnectGraceEndsAt !== null &&
+          p.disconnectGraceEndsAt <= now,
+      );
+      for (const p of expired) {
+        p.doom = 100;
+        p.alive = false;
+        p.disconnectGraceEndsAt = null;
+        if (p.isHost) {
+          this.transferHostFrom(p.id);
+        }
+        this.emitEntityAnnouncement(
+          "SACRIFICE_DISCONNECT",
+          `${p.name} abandoned the ritual and was claimed by the Entity.`,
+          now,
+        );
+        changed = true;
+        const living = this.players.filter((pl) => pl.alive);
+        if (living.length <= 1) {
+          this.endMatch(living, now);
+          break;
+        }
+      }
+      if (changed && this.phase === "IN_MATCH") {
+        this.persist();
+        this.broadcastPlayers();
+      }
+      if (
+        this.phase === "IN_MATCH" &&
+        this.phaseEndsAt !== null &&
+        now >= this.phaseEndsAt
+      ) {
+        this.advanceMatchPhase(now);
+      }
     }
 
     this.rescheduleAlarm();
@@ -302,14 +373,7 @@ export class RoomCore {
     if (this.matchPhase === "SACRIFICE_REVEAL") {
       const living = this.players.filter((p) => p.alive);
       if (living.length <= 1) {
-        this.phase = "POST_MATCH";
-        this.matchPhase = null;
-        this.phaseEndsAt = null;
-        this.sacrificedPlayerId = null;
-        this.winnerId = living[0]?.id ?? null;
-        this.endReason = living.length === 1 ? "SURVIVOR" : "ALL_CLAIMED";
-        this.persist();
-        this.broadcastPhaseChanged(now);
+        this.endMatch(living, now);
         return;
       }
 
@@ -342,6 +406,7 @@ export class RoomCore {
         this.attachConnection(connectionId, existing);
         existing.connected = true;
         existing.disconnectGraceEndsAt = null;
+        this.emptySince = null;
         this.persist();
         this.rescheduleAlarm();
         this.sendSnapshot(connectionId, existing);
@@ -403,8 +468,10 @@ export class RoomCore {
     };
 
     this.players.push(player);
+    this.emptySince = null;
     this.attachConnection(connectionId, player);
     this.persist();
+    this.rescheduleAlarm();
     this.sendSnapshot(connectionId, player);
     this.broadcastPlayers([connectionId]);
   }
@@ -494,6 +561,10 @@ export class RoomCore {
     }
 
     this.removePlayer(target.id);
+    if (this.players.every((p) => !p.connected) && this.emptySince === null) {
+      this.emptySince = this.clock();
+    }
+
     this.persist();
     this.rescheduleAlarm();
     this.broadcastPlayers();
@@ -631,12 +702,38 @@ export class RoomCore {
     const player = this.getAuthenticatedPlayer(connectionId);
     if (!player) return;
 
+    const wasLivingInMatch = this.phase === "IN_MATCH" && player.alive;
+    if (wasLivingInMatch) {
+      player.doom = 100;
+      player.alive = false;
+    }
+
     this.connectionToPlayerId.delete(connectionId);
     this.playerIdToConnectionId.delete(player.id);
     this.removePlayer(player.id);
+    this.transport.close(connectionId, 1000, "Left Room");
+
+    if (wasLivingInMatch) {
+      const now = this.clock();
+      this.emitEntityAnnouncement(
+        "SACRIFICE_DISCONNECT",
+        `${player.name} fled the ritual and was claimed by the Entity.`,
+        now,
+      );
+      const living = this.players.filter((p) => p.alive);
+      if (living.length <= 1) {
+        this.endMatch(living, now);
+        this.rescheduleAlarm();
+        return;
+      }
+    }
+
+    if (this.players.every((p) => !p.connected) && this.emptySince === null) {
+      this.emptySince = this.clock();
+    }
+
     this.persist();
     this.rescheduleAlarm();
-    this.transport.close(connectionId, 1000, "Left Room");
     this.broadcastPlayers();
   }
 
@@ -649,6 +746,31 @@ export class RoomCore {
     this.connectionToPlayerId.set(connectionId, player.id);
     this.playerIdToConnectionId.set(player.id, connectionId);
     this.transport.onAttachPlayer?.(connectionId, player.id);
+  }
+
+  private endMatch(living: InternalPlayer[], now: number): void {
+    this.phase = "POST_MATCH";
+    this.matchPhase = null;
+    this.phaseEndsAt = null;
+    this.sacrificedPlayerId = null;
+    this.winnerId = living[0]?.id ?? null;
+    this.endReason = living.length === 1 ? "SURVIVOR" : "ALL_CLAIMED";
+    this.lastActivityAt = now;
+    this.persist();
+    this.broadcastPhaseChanged(now);
+  }
+
+  private transferHostFrom(departingPlayerId: string): void {
+    const candidates = this.players.filter((p) => p.id !== departingPlayerId);
+    if (candidates.length === 0) return;
+    const connectedCandidates = candidates.filter((p) => p.connected);
+    const pool = connectedCandidates.length > 0 ? connectedCandidates : candidates;
+    const nextHost = pool.reduce((oldest, candidate) =>
+      candidate.joinedAt < oldest.joinedAt ? candidate : oldest,
+    );
+    for (const p of this.players) {
+      p.isHost = p.id === nextHost.id;
+    }
   }
 
   private removePlayer(playerId: string): void {
@@ -816,17 +938,47 @@ export class RoomCore {
     });
   }
 
+  private wipeRoom(): void {
+    for (const connId of [...this.connectionToPlayerId.keys()]) {
+      this.transport.close(connId, 1000, "Room expired");
+    }
+    this.connectionToPlayerId.clear();
+    this.playerIdToConnectionId.clear();
+    this.players = [];
+    this.feed = [];
+    this.phase = "WAITING";
+    this.matchPhase = null;
+    this.phaseEndsAt = null;
+    this.emptySince = null;
+    this.lastActivityAt = null;
+    this.storage.deleteAll();
+  }
+
   private rescheduleAlarm(): void {
     let earliest: number | null = null;
-    if (this.phase === "IN_MATCH" && this.phaseEndsAt !== null) {
-      earliest = this.phaseEndsAt;
+    const consider = (at: number | null) => {
+      if (at === null) return;
+      if (earliest === null || at < earliest) {
+        earliest = at;
+      }
+    };
+
+    if (this.phase === "IN_MATCH") {
+      consider(this.phaseEndsAt);
     }
     for (const p of this.players) {
-      if (!p.connected && p.disconnectGraceEndsAt !== null) {
-        if (earliest === null || p.disconnectGraceEndsAt < earliest) {
-          earliest = p.disconnectGraceEndsAt;
-        }
+      if (!p.connected) {
+        consider(p.disconnectGraceEndsAt);
       }
+    }
+    if (this.emptySince !== null) {
+      consider(this.emptySince + ROOM_EMPTY_CLEANUP_MS);
+    }
+    if (
+      (this.phase === "WAITING" || this.phase === "POST_MATCH") &&
+      this.lastActivityAt !== null
+    ) {
+      consider(this.lastActivityAt + ROOM_IDLE_CLEANUP_MS);
     }
     this.storage.scheduleAlarm(earliest);
   }
@@ -844,6 +996,8 @@ export class RoomCore {
       endReason: this.endReason,
       feed: this.feed,
       players: this.players,
+      emptySince: this.emptySince,
+      lastActivityAt: this.lastActivityAt,
     };
     this.storage.save(JSON.stringify(state));
   }

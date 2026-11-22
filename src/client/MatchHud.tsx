@@ -33,6 +33,7 @@ export interface MatchHudProps {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   serverCooldownEndsAt: number | null;
+  reconnecting?: boolean;
   errorBanner: { code?: ErrorCode; message: string } | null;
   onDismissError: () => void;
   onSendChat: (text: string) => void;
@@ -74,6 +75,7 @@ export function MatchHud({
   endReason,
   feed,
   serverCooldownEndsAt,
+  reconnecting = false,
   errorBanner,
   onDismissError,
   onSendChat,
@@ -189,6 +191,16 @@ export function MatchHud({
           </button>
         </div>
       </header>
+
+      {reconnecting && (
+        <div
+          data-testid="reconnect-banner"
+          role="status"
+          className="shrink-0 z-20 bg-amber-950/90 border-b border-amber-700/70 px-3 py-1.5 text-center text-xs font-semibold text-amber-200"
+        >
+          Connection lost — reconnecting...
+        </div>
+      )}
 
       <div className="vb-body flex-1 min-h-0 flex overflow-hidden">
         <aside

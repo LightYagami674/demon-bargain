@@ -8,6 +8,9 @@ export const MIN_NAME_LENGTH = 1;
 export const MAX_NAME_LENGTH = 16;
 
 export const WAITING_DISCONNECT_GRACE_MS = 30_000;
+export const IN_MATCH_DISCONNECT_GRACE_MS = 45_000;
+export const ROOM_EMPTY_CLEANUP_MS = 15 * 60_000;
+export const ROOM_IDLE_CLEANUP_MS = 60 * 60_000;
 
 export const INITIAL_DOOM = 50;
 export const ROUND_INTRO_MS = 3_500;

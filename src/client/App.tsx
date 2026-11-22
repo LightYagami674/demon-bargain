@@ -459,14 +459,27 @@ function RoomView({
       setSocketOpen(false);
     };
 
+    const handleVisibilityOrOnline = (event: Event) => {
+      if (
+        (event.type === "online" || document.visibilityState === "visible") &&
+        socket.readyState !== 1
+      ) {
+        socket.reconnect?.();
+      }
+    };
+
     socket.addEventListener("open", handleOpen);
     socket.addEventListener("message", handleMessage);
     socket.addEventListener("close", handleClose);
+    document.addEventListener("visibilitychange", handleVisibilityOrOnline);
+    window.addEventListener("online", handleVisibilityOrOnline);
 
     return () => {
       socket.removeEventListener("open", handleOpen);
       socket.removeEventListener("message", handleMessage);
       socket.removeEventListener("close", handleClose);
+      document.removeEventListener("visibilitychange", handleVisibilityOrOnline);
+      window.removeEventListener("online", handleVisibilityOrOnline);
       socket.close();
       socketRef.current = null;
     };
@@ -614,6 +627,7 @@ function RoomView({
         endReason={snapshot.endReason}
         feed={snapshot.feed}
         serverCooldownEndsAt={snapshot.chatCooldownEndsAt}
+        reconnecting={!socketOpen}
         errorBanner={errorBanner}
         onDismissError={() => setErrorBanner(null)}
         onSendChat={(text) => sendMessage({ type: "send_chat", text })}
@@ -658,6 +672,15 @@ function RoomView({
       </header>
 
       <div className="flex-1 w-full max-w-md mx-auto px-4 py-5 space-y-6">
+        {!socketOpen && (
+          <div
+            data-testid="reconnect-banner"
+            role="status"
+            className="rounded-xl border border-amber-700/70 bg-amber-950/60 px-4 py-2.5 text-xs font-semibold text-amber-200 text-center"
+          >
+            Connection lost — reconnecting...
+          </div>
+        )}
         {errorBanner && (
           <div
             role="alert"
