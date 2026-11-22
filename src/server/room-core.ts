@@ -1,13 +1,27 @@
 import {
+  CHAT_COOLDOWN_MS,
+  INITIAL_DOOM,
+  MAX_CHAT_LENGTH,
+  MAX_FEED_ITEMS,
   MAX_PLAYERS,
+  MIN_CHAT_LENGTH,
+  MIN_PLAYERS,
   PRESET_AVATARS,
+  ROUND_INTRO_MS,
+  ROUND_RESOLVING_MS,
+  SACRIFICE_REVEAL_MS,
   WAITING_DISCONNECT_GRACE_MS,
+  getRoundDurationMs,
+  softResetDoom,
   type PresetAvatarId,
 } from "../shared/constants.js";
 import {
   ClientMessageSchema,
   type ClientMessage,
   type ErrorCode,
+  type FeedItem,
+  type MatchEndReason,
+  type MatchPhase,
   type PublicPlayer,
   type RoomPhase,
   type ServerMessage,
@@ -45,11 +59,20 @@ interface InternalPlayer {
   alive: boolean;
   doom: number;
   disconnectGraceEndsAt: number | null;
+  lastChatAt: number | null;
 }
 
 interface PersistedRoomState {
   phase: RoomPhase;
+  matchPhase: MatchPhase | null;
+  round: number;
+  totalRounds: number;
+  initialPlayerCount: number;
   phaseEndsAt: number | null;
+  sacrificedPlayerId: string | null;
+  winnerId: string | null;
+  endReason: MatchEndReason | null;
+  feed: FeedItem[];
   players: InternalPlayer[];
 }
 
@@ -61,7 +84,15 @@ export class RoomCore {
   private readonly generateId: () => string;
 
   private phase: RoomPhase = "WAITING";
+  private matchPhase: MatchPhase | null = null;
+  private round = 0;
+  private totalRounds = 0;
+  private initialPlayerCount = 0;
   private phaseEndsAt: number | null = null;
+  private sacrificedPlayerId: string | null = null;
+  private winnerId: string | null = null;
+  private endReason: MatchEndReason | null = null;
+  private feed: FeedItem[] = [];
   private players: InternalPlayer[] = [];
   private connectionToPlayerId = new Map<string, string>();
   private playerIdToConnectionId = new Map<string, string>();
@@ -78,8 +109,19 @@ export class RoomCore {
       try {
         const parsed = JSON.parse(raw) as PersistedRoomState;
         this.phase = parsed.phase;
+        this.matchPhase = parsed.matchPhase ?? null;
+        this.round = parsed.round ?? 0;
+        this.totalRounds = parsed.totalRounds ?? 0;
+        this.initialPlayerCount = parsed.initialPlayerCount ?? 0;
         this.phaseEndsAt = parsed.phaseEndsAt;
-        this.players = parsed.players;
+        this.sacrificedPlayerId = parsed.sacrificedPlayerId ?? null;
+        this.winnerId = parsed.winnerId ?? null;
+        this.endReason = parsed.endReason ?? null;
+        this.feed = parsed.feed ?? [];
+        this.players = (parsed.players ?? []).map((p) => ({
+          ...p,
+          lastChatAt: p.lastChatAt ?? null,
+        }));
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
@@ -98,6 +140,14 @@ export class RoomCore {
   setPhaseForMatch(phase: RoomPhase, phaseEndsAt: number | null = null): void {
     this.phase = phase;
     this.phaseEndsAt = phaseEndsAt;
+    this.persist();
+  }
+
+  /** Exposed for server-side tests or Doom updates in downstream tickets */
+  setPlayerDoomForMatch(playerId: string, doom: number): void {
+    const player = this.players.find((p) => p.id === playerId);
+    if (!player) return;
+    player.doom = Math.max(0, Math.min(100, Math.round(doom)));
     this.persist();
   }
 
@@ -130,6 +180,12 @@ export class RoomCore {
         return;
       case "kick_player":
         this.handleKickPlayer(connectionId, msg.targetPlayerId);
+        return;
+      case "start_match":
+        this.handleStartMatch(connectionId);
+        return;
+      case "send_chat":
+        this.handleSendChat(connectionId, msg.text);
         return;
       case "leave_room":
         this.handleLeaveRoom(connectionId);
@@ -183,13 +239,95 @@ export class RoomCore {
         this.removePlayer(p.id);
         changed = true;
       }
+      if (changed) {
+        this.persist();
+        this.broadcastPlayers();
+      }
+    } else if (
+      this.phase === "IN_MATCH" &&
+      this.phaseEndsAt !== null &&
+      now >= this.phaseEndsAt
+    ) {
+      this.advanceMatchPhase(now);
     }
 
-    if (changed) {
-      this.persist();
-      this.broadcastPlayers();
-    }
     this.rescheduleAlarm();
+  }
+
+  private advanceMatchPhase(now: number): void {
+    if (this.matchPhase === "ROUND_INTRO") {
+      const livingCount = this.players.filter((p) => p.alive).length;
+      this.matchPhase = "ROUND_ACTIVE";
+      this.phaseEndsAt =
+        now + getRoundDurationMs(livingCount, this.initialPlayerCount);
+      this.persist();
+      this.broadcastPhaseChanged(now);
+      return;
+    }
+
+    if (this.matchPhase === "ROUND_ACTIVE") {
+      this.matchPhase = "ROUND_RESOLVING";
+      this.phaseEndsAt = now + ROUND_RESOLVING_MS;
+      this.persist();
+      this.broadcastPhaseChanged(now);
+      return;
+    }
+
+    if (this.matchPhase === "ROUND_RESOLVING") {
+      const living = this.players.filter((p) => p.alive);
+      let victim: InternalPlayer | null = null;
+      for (const candidate of living) {
+        if (!victim || candidate.doom > victim.doom) {
+          victim = candidate;
+        }
+      }
+      if (victim) {
+        victim.alive = false;
+        this.sacrificedPlayerId = victim.id;
+      }
+      this.matchPhase = "SACRIFICE_REVEAL";
+      this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
+      this.persist();
+      this.broadcastPhaseChanged(now);
+      if (victim) {
+        this.emitEntityAnnouncement(
+          "SACRIFICE_REVEAL",
+          `${victim.name} has been claimed by the Entity.`,
+          now,
+        );
+      }
+      return;
+    }
+
+    if (this.matchPhase === "SACRIFICE_REVEAL") {
+      const living = this.players.filter((p) => p.alive);
+      if (living.length <= 1) {
+        this.phase = "POST_MATCH";
+        this.matchPhase = null;
+        this.phaseEndsAt = null;
+        this.sacrificedPlayerId = null;
+        this.winnerId = living[0]?.id ?? null;
+        this.endReason = living.length === 1 ? "SURVIVOR" : "ALL_CLAIMED";
+        this.persist();
+        this.broadcastPhaseChanged(now);
+        return;
+      }
+
+      this.round += 1;
+      this.sacrificedPlayerId = null;
+      for (const p of living) {
+        p.doom = softResetDoom(p.doom);
+      }
+      this.matchPhase = "ROUND_INTRO";
+      this.phaseEndsAt = now + ROUND_INTRO_MS;
+      this.persist();
+      this.broadcastPhaseChanged(now);
+      this.emitEntityAnnouncement(
+        "ROUND_INTRO",
+        `Round ${this.round} begins. The Entity turns its gaze upon you.`,
+        now,
+      );
+    }
   }
 
   private handleJoin(
@@ -259,8 +397,9 @@ export class RoomCore {
       connected: true,
       joinedAt: now,
       alive: true,
-      doom: 50,
+      doom: INITIAL_DOOM,
       disconnectGraceEndsAt: null,
+      lastChatAt: null,
     };
 
     this.players.push(player);
@@ -360,6 +499,134 @@ export class RoomCore {
     this.broadcastPlayers();
   }
 
+  private handleStartMatch(connectionId: string): void {
+    const caller = this.getAuthenticatedPlayer(connectionId);
+    if (!caller) return;
+
+    if (this.phase !== "WAITING") {
+      this.sendError(
+        connectionId,
+        "ROOM_LOCKED",
+        "A Match is already in progress or finished.",
+      );
+      return;
+    }
+
+    if (!caller.isHost) {
+      this.sendError(
+        connectionId,
+        "NOT_HOST",
+        "Only the Host can start the Match.",
+      );
+      return;
+    }
+
+    if (this.players.length < MIN_PLAYERS || this.players.length > MAX_PLAYERS) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        `Need ${MIN_PLAYERS}–${MAX_PLAYERS} players to start a Match.`,
+      );
+      return;
+    }
+
+    const now = this.clock();
+    this.phase = "IN_MATCH";
+    this.matchPhase = "ROUND_INTRO";
+    this.round = 1;
+    this.initialPlayerCount = this.players.length;
+    this.totalRounds = Math.max(1, this.initialPlayerCount - 1);
+    this.sacrificedPlayerId = null;
+    this.winnerId = null;
+    this.endReason = null;
+    this.feed = [];
+    this.phaseEndsAt = now + ROUND_INTRO_MS;
+
+    for (const p of this.players) {
+      p.alive = true;
+      p.doom = INITIAL_DOOM;
+      p.lastChatAt = null;
+    }
+
+    this.persist();
+    this.rescheduleAlarm();
+    this.broadcastPhaseChanged(now);
+    this.emitEntityAnnouncement(
+      "ROUND_INTRO",
+      `Round 1 begins. The Entity turns its gaze upon you.`,
+      now,
+    );
+  }
+
+  private handleSendChat(connectionId: string, rawText: string): void {
+    const player = this.getAuthenticatedPlayer(connectionId);
+    if (!player) return;
+
+    if (this.phase !== "IN_MATCH" || this.matchPhase !== "ROUND_ACTIVE") {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Public chat is only open during an active round.",
+      );
+      return;
+    }
+
+    if (!player.alive) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Ghosts cannot plead in public chat.",
+      );
+      return;
+    }
+
+    const text = rawText.trim();
+    if (text.length < MIN_CHAT_LENGTH || text.length > MAX_CHAT_LENGTH) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        `Message must be ${MIN_CHAT_LENGTH}–${MAX_CHAT_LENGTH} characters.`,
+      );
+      return;
+    }
+
+    const now = this.clock();
+    if (player.lastChatAt !== null && now - player.lastChatAt < CHAT_COOLDOWN_MS) {
+      const retryAfterMs = CHAT_COOLDOWN_MS - (now - player.lastChatAt);
+      this.sendError(
+        connectionId,
+        "COOLDOWN_ACTIVE",
+        "Wait before pleading again.",
+        retryAfterMs,
+      );
+      return;
+    }
+
+    player.lastChatAt = now;
+    const id = this.generateId();
+    this.pushFeedItem({
+      kind: "chat",
+      id,
+      playerId: player.id,
+      playerName: player.name,
+      avatarId: player.avatarId,
+      text,
+      timestamp: now,
+    });
+    this.persist();
+
+    const payload: ServerMessage = {
+      type: "chat_message",
+      id,
+      playerId: player.id,
+      playerName: player.name,
+      avatarId: player.avatarId,
+      text,
+      timestamp: now,
+    };
+    this.transport.broadcast(JSON.stringify(payload));
+  }
+
   private handleLeaveRoom(connectionId: string): void {
     const player = this.getAuthenticatedPlayer(connectionId);
     if (!player) return;
@@ -450,6 +717,12 @@ export class RoomCore {
   }
 
   private sendSnapshot(connectionId: string, recipient: InternalPlayer): void {
+    const now = this.clock();
+    const chatCooldownEndsAt =
+      recipient.lastChatAt !== null &&
+      now - recipient.lastChatAt < CHAT_COOLDOWN_MS
+        ? recipient.lastChatAt + CHAT_COOLDOWN_MS
+        : null;
     this.send(connectionId, {
       type: "room_snapshot",
       roomCode: this.roomCode,
@@ -457,9 +730,64 @@ export class RoomCore {
       selfPlayerId: recipient.id,
       playerToken: recipient.playerToken,
       players: this.toPublicPlayers(),
-      serverNow: this.clock(),
+      serverNow: now,
       phaseEndsAt: this.phaseEndsAt,
+      matchPhase: this.matchPhase,
+      round: this.round,
+      totalRounds: this.totalRounds,
+      sacrificedPlayerId: this.sacrificedPlayerId,
+      winnerId: this.winnerId,
+      endReason: this.endReason,
+      feed: this.feed,
+      chatCooldownEndsAt,
     });
+  }
+
+  private broadcastPhaseChanged(now: number): void {
+    const payload: ServerMessage = {
+      type: "phase_changed",
+      phase: this.phase,
+      matchPhase: this.matchPhase,
+      round: this.round,
+      totalRounds: this.totalRounds,
+      serverNow: now,
+      phaseEndsAt: this.phaseEndsAt,
+      players: this.toPublicPlayers(),
+      sacrificedPlayerId: this.sacrificedPlayerId,
+      winnerId: this.winnerId,
+      endReason: this.endReason,
+    };
+    this.transport.broadcast(JSON.stringify(payload));
+  }
+
+  private emitEntityAnnouncement(
+    beatType: string,
+    text: string,
+    timestamp: number,
+  ): void {
+    const id = this.generateId();
+    this.pushFeedItem({
+      kind: "entity",
+      id,
+      beatType,
+      text,
+      timestamp,
+    });
+    const payload: ServerMessage = {
+      type: "entity_announcement",
+      id,
+      beatType,
+      text,
+      timestamp,
+    };
+    this.transport.broadcast(JSON.stringify(payload));
+  }
+
+  private pushFeedItem(item: FeedItem): void {
+    this.feed.push(item);
+    if (this.feed.length > MAX_FEED_ITEMS) {
+      this.feed.splice(0, this.feed.length - MAX_FEED_ITEMS);
+    }
   }
 
   private broadcastPlayers(excludeConnectionIds?: string[]): void {
@@ -490,6 +818,9 @@ export class RoomCore {
 
   private rescheduleAlarm(): void {
     let earliest: number | null = null;
+    if (this.phase === "IN_MATCH" && this.phaseEndsAt !== null) {
+      earliest = this.phaseEndsAt;
+    }
     for (const p of this.players) {
       if (!p.connected && p.disconnectGraceEndsAt !== null) {
         if (earliest === null || p.disconnectGraceEndsAt < earliest) {
@@ -503,7 +834,15 @@ export class RoomCore {
   private persist(): void {
     const state: PersistedRoomState = {
       phase: this.phase,
+      matchPhase: this.matchPhase,
+      round: this.round,
+      totalRounds: this.totalRounds,
+      initialPlayerCount: this.initialPlayerCount,
       phaseEndsAt: this.phaseEndsAt,
+      sacrificedPlayerId: this.sacrificedPlayerId,
+      winnerId: this.winnerId,
+      endReason: this.endReason,
+      feed: this.feed,
       players: this.players,
     };
     this.storage.save(JSON.stringify(state));

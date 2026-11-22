@@ -8,7 +8,43 @@ import {
 export const RoomPhaseSchema = z.enum(["WAITING", "IN_MATCH", "POST_MATCH"]);
 export type RoomPhase = z.infer<typeof RoomPhaseSchema>;
 
+export const MatchPhaseSchema = z.enum([
+  "ROUND_INTRO",
+  "ROUND_ACTIVE",
+  "ROUND_RESOLVING",
+  "SACRIFICE_REVEAL",
+]);
+export type MatchPhase = z.infer<typeof MatchPhaseSchema>;
+
+export const MatchEndReasonSchema = z.enum([
+  "SURVIVOR",
+  "ALL_CLAIMED",
+  "JUDGE_ERROR",
+]);
+export type MatchEndReason = z.infer<typeof MatchEndReasonSchema>;
+
 export const PresetAvatarIdSchema = z.enum(PRESET_AVATAR_IDS);
+
+export const FeedItemSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("chat"),
+    id: z.string(),
+    playerId: z.string(),
+    playerName: z.string(),
+    avatarId: PresetAvatarIdSchema,
+    text: z.string(),
+    timestamp: z.number(),
+    doomDelta: z.number().int().optional(),
+  }),
+  z.object({
+    kind: z.literal("entity"),
+    id: z.string(),
+    beatType: z.string(),
+    text: z.string(),
+    timestamp: z.number(),
+  }),
+]);
+export type FeedItem = z.infer<typeof FeedItemSchema>;
 
 export const ErrorCodeSchema = z.enum([
   "ROOM_FULL",
@@ -92,10 +128,47 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     players: z.array(PublicPlayerSchema),
     serverNow: z.number(),
     phaseEndsAt: z.number().nullable(),
+    matchPhase: MatchPhaseSchema.nullable().optional(),
+    round: z.number().int().min(0).optional(),
+    totalRounds: z.number().int().min(0).optional(),
+    sacrificedPlayerId: z.string().nullable().optional(),
+    winnerId: z.string().nullable().optional(),
+    endReason: MatchEndReasonSchema.nullable().optional(),
+    feed: z.array(FeedItemSchema).optional(),
+    chatCooldownEndsAt: z.number().nullable().optional(),
   }),
   z.object({
     type: z.literal("player_updated"),
     players: z.array(PublicPlayerSchema),
+  }),
+  z.object({
+    type: z.literal("phase_changed"),
+    phase: RoomPhaseSchema,
+    matchPhase: MatchPhaseSchema.nullable(),
+    round: z.number().int().min(0),
+    totalRounds: z.number().int().min(0),
+    serverNow: z.number(),
+    phaseEndsAt: z.number().nullable(),
+    players: z.array(PublicPlayerSchema),
+    sacrificedPlayerId: z.string().nullable().optional(),
+    winnerId: z.string().nullable().optional(),
+    endReason: MatchEndReasonSchema.nullable().optional(),
+  }),
+  z.object({
+    type: z.literal("chat_message"),
+    id: z.string(),
+    playerId: z.string(),
+    playerName: z.string(),
+    avatarId: PresetAvatarIdSchema,
+    text: z.string(),
+    timestamp: z.number(),
+  }),
+  z.object({
+    type: z.literal("entity_announcement"),
+    id: z.string(),
+    beatType: z.string(),
+    text: z.string(),
+    timestamp: z.number(),
   }),
   z.object({
     type: z.literal("kicked"),

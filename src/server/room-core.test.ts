@@ -404,3 +404,261 @@ describe("Room WebSocket seam — join, validation, preset avatars & capacity", 
     });
   });
 });
+
+describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live public pleading", () => {
+  it("allows Host to start a 2-6 player Match, rejects non-Hosts and <2 players, and locks Room to new joiners", () => {
+    const h = new FakeRoomHarness();
+    h.send("c1", { type: "join", name: "Alice" });
+
+    // Fewer than 2 players -> rejected
+    h.send("c1", { type: "start_match" });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "error",
+      code: "INVALID_PAYLOAD",
+    });
+
+    h.send("c2", { type: "join", name: "Bob" });
+
+    // Non-Host -> NOT_HOST
+    h.send("c2", { type: "start_match" });
+    expect(h.lastMessageFor("c2")).toMatchObject({
+      type: "error",
+      code: "NOT_HOST",
+    });
+
+    h.clearMessages();
+    const startTime = h.now;
+    h.send("c1", { type: "start_match" });
+
+    const phaseMsg = h
+      .messagesFor("c1")
+      .find((m) => m.type === "phase_changed");
+    expect(phaseMsg).toMatchObject({
+      type: "phase_changed",
+      phase: "IN_MATCH",
+      matchPhase: "ROUND_INTRO",
+      round: 1,
+      totalRounds: 1,
+      serverNow: startTime,
+      phaseEndsAt: startTime + 3500,
+    });
+    if (phaseMsg?.type !== "phase_changed") throw new Error("expected phase_changed");
+    expect(phaseMsg.players.every((p) => p.alive && p.doom === 50)).toBe(true);
+
+    // Room is now locked to new joiners
+    h.send("c3", { type: "join", name: "Carol" });
+    expect(h.lastMessageFor("c3")).toMatchObject({
+      type: "error",
+      code: "ROOM_LOCKED",
+    });
+  });
+
+  it("runs a 2-player Match with 60s ROUND_ACTIVE, eliminates highest-Doom player into Ghost, and ends in POST_MATCH", () => {
+    const h = new FakeRoomHarness();
+    h.send("c1", { type: "join", name: "Alice" });
+    h.send("c2", { type: "join", name: "Bob" });
+    const snap2 = h.messagesFor("c2").find((m) => m.type === "room_snapshot");
+    if (snap2?.type !== "room_snapshot") throw new Error("expected snapshot");
+
+    h.send("c1", { type: "start_match" });
+    h.clearMessages();
+
+    // Advance past ROUND_INTRO (3500ms) -> ROUND_ACTIVE (60_000ms for 2p)
+    h.advanceTime(3500);
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "phase_changed",
+      phase: "IN_MATCH",
+      matchPhase: "ROUND_ACTIVE",
+      round: 1,
+      serverNow: h.now,
+      phaseEndsAt: h.now + 60_000,
+    });
+
+    // Give Bob higher Doom so Bob is claimed at round end
+    h.room.setPlayerDoomForMatch(snap2.selfPlayerId, 78);
+
+    // Advance 60_000ms -> ROUND_RESOLVING (2000ms)
+    h.clearMessages();
+    h.advanceTime(60_000);
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "phase_changed",
+      phase: "IN_MATCH",
+      matchPhase: "ROUND_RESOLVING",
+      serverNow: h.now,
+      phaseEndsAt: h.now + 2000,
+    });
+
+    // Advance 2000ms -> SACRIFICE_REVEAL (4500ms) with Bob as Ghost
+    h.clearMessages();
+    h.advanceTime(2000);
+    const revealMsg = h
+      .messagesFor("c1")
+      .find((m) => m.type === "phase_changed");
+    expect(revealMsg).toMatchObject({
+      type: "phase_changed",
+      phase: "IN_MATCH",
+      matchPhase: "SACRIFICE_REVEAL",
+      sacrificedPlayerId: snap2.selfPlayerId,
+      serverNow: h.now,
+      phaseEndsAt: h.now + 4500,
+    });
+    if (revealMsg?.type !== "phase_changed") throw new Error("expected phase_changed");
+    const bobAfterReveal = revealMsg.players.find(
+      (p) => p.id === snap2.selfPlayerId,
+    );
+    expect(bobAfterReveal?.alive).toBe(false);
+
+    // Advance 4500ms -> POST_MATCH with Alice as winner
+    h.clearMessages();
+    h.advanceTime(4500);
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "phase_changed",
+      phase: "POST_MATCH",
+      matchPhase: null,
+      endReason: "SURVIVOR",
+      phaseEndsAt: null,
+    });
+  });
+
+  it("follows the 6->90s, 5->75s, 4->65s, 3->55s, 2->45s duration curve and soft-resets Doom between rounds", () => {
+    const h = new FakeRoomHarness();
+    const ids: string[] = [];
+    for (let i = 1; i <= 6; i++) {
+      const cid = `c${i}`;
+      h.send(cid, { type: "join", name: `P${i}` });
+      const snap = h.messagesFor(cid).find((m) => m.type === "room_snapshot");
+      if (snap?.type !== "room_snapshot") throw new Error("expected snapshot");
+      ids.push(snap.selfPlayerId);
+    }
+
+    h.send("c1", { type: "start_match" });
+
+    const expectedDurations = [90_000, 75_000, 65_000, 55_000, 45_000];
+    for (let r = 0; r < expectedDurations.length; r++) {
+      const expectedMs = expectedDurations[r]!;
+      h.clearMessages();
+      h.advanceTime(3500); // ROUND_INTRO -> ROUND_ACTIVE
+      const activeMsg = h.lastMessageFor("c1");
+      expect(activeMsg).toMatchObject({
+        type: "phase_changed",
+        matchPhase: "ROUND_ACTIVE",
+        round: r + 1,
+        phaseEndsAt: h.now + expectedMs,
+      });
+
+      // Set highest Doom on victim P(6-r), and set P1 to 81% on round 1 to test soft-reset
+      if (r === 0) {
+        h.room.setPlayerDoomForMatch(ids[0]!, 81); // round((81+50)/2) = 66
+      }
+      const victimId = ids[5 - r]!;
+      h.room.setPlayerDoomForMatch(victimId, 95);
+
+      h.advanceTime(expectedMs); // -> ROUND_RESOLVING
+      h.advanceTime(2000); // -> SACRIFICE_REVEAL
+      h.clearMessages();
+      h.advanceTime(4500); // -> next ROUND_INTRO or POST_MATCH
+
+      const nextPhase = h
+        .messagesFor("c1")
+        .find((m) => m.type === "phase_changed");
+      if (nextPhase?.type !== "phase_changed") throw new Error("expected phase_changed");
+      if (r === 0) {
+        // Verify Doom soft-reset: round((81 + 50) / 2) = 66
+        const p1 = nextPhase.players.find((p) => p.id === ids[0]);
+        expect(p1?.doom).toBe(66);
+      }
+      if (r === expectedDurations.length - 1) {
+        expect(nextPhase.phase).toBe("POST_MATCH");
+        expect(nextPhase.winnerId).toBe(ids[0]);
+      } else {
+        expect(nextPhase.matchPhase).toBe("ROUND_INTRO");
+        expect(nextPhase.round).toBe(r + 2);
+      }
+    }
+  });
+
+  it("gates public chat to ROUND_ACTIVE living players, enforces 2-200 chars & 2.5s cooldown, and broadcasts immediately", () => {
+    const h = new FakeRoomHarness();
+    h.send("c1", { type: "join", name: "Alice" });
+    h.send("c2", { type: "join", name: "Bob" });
+    h.send("c3", { type: "join", name: "Carol" });
+    const snap3 = h.messagesFor("c3").find((m) => m.type === "room_snapshot");
+    if (snap3?.type !== "room_snapshot") throw new Error("expected snapshot");
+
+    h.send("c1", { type: "start_match" });
+
+    // Rejected during ROUND_INTRO
+    h.send("c1", { type: "send_chat", text: "Spare me!" });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "error",
+      code: "INVALID_PAYLOAD",
+    });
+
+    // Advance to ROUND_ACTIVE
+    h.advanceTime(3500);
+
+    // Too short (< 2 chars) or too long (> 200 chars) -> INVALID_PAYLOAD
+    h.send("c1", { type: "send_chat", text: " a " });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "error",
+      code: "INVALID_PAYLOAD",
+    });
+    h.send("c1", { type: "send_chat", text: "x".repeat(201) });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "error",
+      code: "INVALID_PAYLOAD",
+    });
+
+    // Valid chat broadcasts immediately to all players
+    h.clearMessages();
+    h.send("c1", { type: "send_chat", text: "I am innocent!" });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "chat_message",
+      playerName: "Alice",
+      text: "I am innocent!",
+    });
+    expect(h.lastMessageFor("c2")).toMatchObject({
+      type: "chat_message",
+      playerName: "Alice",
+      text: "I am innocent!",
+    });
+
+    // 2.5s cooldown enforced for Alice, but Bob can speak immediately
+    h.advanceTime(1000);
+    h.send("c1", { type: "send_chat", text: "Please believe me!" });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "error",
+      code: "COOLDOWN_ACTIVE",
+      retryAfterMs: 1500,
+    });
+
+    h.send("c2", { type: "send_chat", text: "Alice is lying!" });
+    expect(h.lastMessageFor("c2")).toMatchObject({
+      type: "chat_message",
+      playerName: "Bob",
+      text: "Alice is lying!",
+    });
+
+    // After remaining 1500ms, Alice can speak again
+    h.advanceTime(1500);
+    h.send("c1", { type: "send_chat", text: "Look at Carol!" });
+    expect(h.lastMessageFor("c1")).toMatchObject({
+      type: "chat_message",
+      playerName: "Alice",
+      text: "Look at Carol!",
+    });
+
+    // Eliminate Carol -> Round 2 -> Ghosts cannot send public chat
+    h.room.setPlayerDoomForMatch(snap3.selfPlayerId, 99);
+    h.advanceTime(65_000 - 2500); // finish ROUND_ACTIVE
+    h.advanceTime(2000); // ROUND_RESOLVING -> SACRIFICE_REVEAL
+    h.advanceTime(4500); // -> Round 2 ROUND_INTRO
+    h.advanceTime(3500); // -> Round 2 ROUND_ACTIVE
+
+    h.send("c3", { type: "send_chat", text: "Ghost speaking!" });
+    expect(h.lastMessageFor("c3")).toMatchObject({
+      type: "error",
+      code: "INVALID_PAYLOAD",
+    });
+  });
+});

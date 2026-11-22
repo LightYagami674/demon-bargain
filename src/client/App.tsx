@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  MAX_FEED_ITEMS,
   MAX_NAME_LENGTH,
   MAX_PLAYERS,
   MIN_PLAYERS,
@@ -12,10 +13,14 @@ import {
   ServerMessageSchema,
   type ClientMessage,
   type ErrorCode,
+  type FeedItem,
+  type MatchEndReason,
+  type MatchPhase,
   type PublicPlayer,
   type RoomPhase,
   type ServerMessage,
 } from "../shared/protocol.js";
+import { MatchHud } from "./MatchHud.js";
 import {
   createPartyRoomSocket,
   type CreateRoomSocket,
@@ -50,9 +55,18 @@ function parseRoute(pathname: string): Route {
 interface RoomSnapshotState {
   roomCode: string;
   phase: RoomPhase;
+  matchPhase: MatchPhase | null;
+  round: number;
+  totalRounds: number;
   selfPlayerId: string;
   players: PublicPlayer[];
   phaseEndsAt: number | null;
+  clockOffsetMs: number;
+  sacrificedPlayerId: string | null;
+  winnerId: string | null;
+  endReason: MatchEndReason | null;
+  feed: FeedItem[];
+  chatCooldownEndsAt: number | null;
 }
 
 export function App({ createSocket = createPartyRoomSocket }: AppProps) {
@@ -350,9 +364,18 @@ function RoomView({
           setSnapshot({
             roomCode: msg.roomCode,
             phase: msg.phase,
+            matchPhase: msg.matchPhase ?? null,
+            round: msg.round ?? 0,
+            totalRounds: msg.totalRounds ?? 0,
             selfPlayerId: msg.selfPlayerId,
             players: msg.players,
             phaseEndsAt: msg.phaseEndsAt,
+            clockOffsetMs: msg.serverNow - Date.now(),
+            sacrificedPlayerId: msg.sacrificedPlayerId ?? null,
+            winnerId: msg.winnerId ?? null,
+            endReason: msg.endReason ?? null,
+            feed: msg.feed ?? [],
+            chatCooldownEndsAt: msg.chatCooldownEndsAt ?? null,
           });
           break;
         }
@@ -364,6 +387,58 @@ function RoomView({
               setPreferredAvatar(me.avatarId);
             }
             return { ...prev, players: msg.players };
+          });
+          break;
+        }
+        case "phase_changed": {
+          setErrorBanner(null);
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              phase: msg.phase,
+              matchPhase: msg.matchPhase,
+              round: msg.round,
+              totalRounds: msg.totalRounds,
+              phaseEndsAt: msg.phaseEndsAt,
+              clockOffsetMs: msg.serverNow - Date.now(),
+              players: msg.players,
+              sacrificedPlayerId: msg.sacrificedPlayerId ?? null,
+              winnerId: msg.winnerId ?? null,
+              endReason: msg.endReason ?? null,
+            };
+          });
+          break;
+        }
+        case "chat_message": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const item: FeedItem = {
+              kind: "chat",
+              id: msg.id,
+              playerId: msg.playerId,
+              playerName: msg.playerName,
+              avatarId: msg.avatarId,
+              text: msg.text,
+              timestamp: msg.timestamp,
+            };
+            const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
+            return { ...prev, feed: nextFeed };
+          });
+          break;
+        }
+        case "entity_announcement": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const item: FeedItem = {
+              kind: "entity",
+              id: msg.id,
+              beatType: msg.beatType,
+              text: msg.text,
+              timestamp: msg.timestamp,
+            };
+            const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
+            return { ...prev, feed: nextFeed };
           });
           break;
         }
@@ -519,6 +594,31 @@ function RoomView({
             )}
         </div>
       </main>
+    );
+  }
+
+  if (snapshot.phase === "IN_MATCH" || snapshot.phase === "POST_MATCH") {
+    return (
+      <MatchHud
+        roomCode={snapshot.roomCode}
+        phase={snapshot.phase}
+        matchPhase={snapshot.matchPhase}
+        round={snapshot.round}
+        totalRounds={snapshot.totalRounds}
+        phaseEndsAt={snapshot.phaseEndsAt}
+        clockOffsetMs={snapshot.clockOffsetMs}
+        players={snapshot.players}
+        selfPlayerId={snapshot.selfPlayerId}
+        sacrificedPlayerId={snapshot.sacrificedPlayerId}
+        winnerId={snapshot.winnerId}
+        endReason={snapshot.endReason}
+        feed={snapshot.feed}
+        serverCooldownEndsAt={snapshot.chatCooldownEndsAt}
+        errorBanner={errorBanner}
+        onDismissError={() => setErrorBanner(null)}
+        onSendChat={(text) => sendMessage({ type: "send_chat", text })}
+        onLeave={handleLeave}
+      />
     );
   }
 

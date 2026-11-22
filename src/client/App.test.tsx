@@ -269,3 +269,235 @@ describe("SPA Socket Seam — Room creation, join, avatar swap, kick, leave & re
     expect(window.location.pathname).toBe("/");
   });
 });
+
+describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live public pleading", () => {
+  let sockets: FakeRoomSocket[];
+  let createSocket: CreateRoomSocket;
+
+  beforeEach(() => {
+    cleanup();
+    window.localStorage.clear();
+    window.history.replaceState({}, "", "/");
+    sockets = [];
+    createSocket = (roomCode) => {
+      const sock = new FakeRoomSocket(roomCode);
+      sockets.push(sock);
+      return sock;
+    };
+  });
+
+  it("transitions from WAITING to Variant B HUD with left rail SVG Doom rings, Ghost badges, and clock-skew-adjusted timer", async () => {
+    const user = userEvent.setup();
+    setRoomToken("WXYZ", "tok-alice");
+    window.history.replaceState({}, "", "/room/WXYZ");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+
+    const twoPlayers = [
+      {
+        id: "p1",
+        name: "Alice",
+        avatarId: "skull" as const,
+        isHost: true,
+        connected: true,
+        joinedAt: 1_700_000_000_000,
+        alive: true,
+        doom: 50,
+      },
+      {
+        id: "p2",
+        name: "Bob",
+        avatarId: "raven" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: 1_700_000_000_100,
+        alive: true,
+        doom: 50,
+      },
+    ];
+
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "WXYZ",
+        phase: "WAITING",
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: Date.now(),
+        phaseEndsAt: null,
+        players: twoPlayers,
+      });
+    });
+
+    await user.click(screen.getByRole("button", { name: /start match/i }));
+    expect(sock.sent).toContainEqual({ type: "start_match" });
+
+    // Server clock is +60s ahead of client Date.now() to verify skew adjustment
+    const skewedServerNow = Date.now() + 60_000;
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        serverNow: skewedServerNow,
+        phaseEndsAt: skewedServerNow + 60_000,
+        players: [
+          { ...twoPlayers[0]!, doom: 82 },
+          { ...twoPlayers[1]!, alive: false, doom: 100 },
+        ],
+      });
+    });
+
+    // Header shows Room code, round, and 01:00 timer (skew-adjusted, not 02:00)
+    expect(screen.getByText("WXYZ")).toBeInTheDocument();
+    expect(screen.getByTestId("hud-timer")).toHaveTextContent("01:00");
+
+    // Left vertical rail renders SVG Doom rings and Ghost badge
+    const rail = screen.getByTestId("player-rail");
+    expect(rail).toHaveTextContent("Alice");
+    expect(rail).toHaveTextContent("82%");
+    expect(rail).toHaveTextContent("Bob");
+    expect(rail).toHaveTextContent("GHOST");
+    expect(rail.querySelectorAll("svg circle").length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("enforces 2-200 char & 2.5s cooldown on public chat, renders chat & Entity announcements, and locks Ghost composer", async () => {
+    const user = userEvent.setup();
+    setRoomToken("WXYZ", "tok-alice");
+    window.history.replaceState({}, "", "/room/WXYZ");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    const now = Date.now();
+
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "WXYZ",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 60_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+
+    const input = screen.getByPlaceholderText(/plead for your life/i);
+    const sendBtn = screen.getByRole("button", { name: /send/i });
+
+    // 1-char message is blocked client-side
+    await user.type(input, "a");
+    await user.click(sendBtn);
+    expect(sock.sent.filter((m) => m.type === "send_chat")).toHaveLength(0);
+
+    // Valid message sends immediately
+    await user.type(input, "lmost certain Bob lied");
+    await user.click(sendBtn);
+    expect(sock.sent).toContainEqual({
+      type: "send_chat",
+      text: "almost certain Bob lied",
+    });
+
+    // Cooldown prevents immediate second send
+    await user.type(input, "Second plea");
+    await user.click(sendBtn);
+    expect(sock.sent.filter((m) => m.type === "send_chat")).toHaveLength(1);
+
+    // Server broadcasts chat_message and entity_announcement
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m1",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "almost certain Bob lied",
+        timestamp: now + 500,
+      });
+      sock.emitServerMessage({
+        type: "entity_announcement",
+        id: "e1",
+        beatType: "ROUND_INTRO",
+        text: "Round 1 begins. The Entity turns its gaze upon you.",
+        timestamp: now + 600,
+      });
+    });
+
+    const feed = screen.getByTestId("chat-feed");
+    expect(feed).toHaveTextContent("almost certain Bob lied");
+    expect(feed).toHaveTextContent(
+      "Round 1 begins. The Entity turns its gaze upon you.",
+    );
+
+    // Transition Alice to Ghost -> composer disabled
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "IN_MATCH",
+        matchPhase: "SACRIFICE_REVEAL",
+        round: 1,
+        totalRounds: 1,
+        serverNow: now + 60_000,
+        phaseEndsAt: now + 64_500,
+        sacrificedPlayerId: "p1",
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: false,
+            doom: 100,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+        ],
+      });
+    });
+
+    expect(
+      screen.getByPlaceholderText(/ghost/i),
+    ).toBeDisabled();
+  });
+});

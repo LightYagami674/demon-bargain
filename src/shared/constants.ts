@@ -9,6 +9,44 @@ export const MAX_NAME_LENGTH = 16;
 
 export const WAITING_DISCONNECT_GRACE_MS = 30_000;
 
+export const INITIAL_DOOM = 50;
+export const ROUND_INTRO_MS = 3_500;
+export const ROUND_RESOLVING_MS = 2_000;
+export const SACRIFICE_REVEAL_MS = 4_500;
+
+export const CHAT_COOLDOWN_MS = 2_500;
+export const MIN_CHAT_LENGTH = 2;
+export const MAX_CHAT_LENGTH = 200;
+export const MAX_FEED_ITEMS = 200;
+
+const ROUND_DURATION_BY_LIVING_MS: Record<number, number> = {
+  6: 90_000,
+  5: 75_000,
+  4: 65_000,
+  3: 55_000,
+  2: 45_000,
+};
+
+export function getRoundDurationMs(
+  livingCount: number,
+  initialPlayerCount: number,
+): number {
+  if (initialPlayerCount <= 2) {
+    return 60_000;
+  }
+  return ROUND_DURATION_BY_LIVING_MS[livingCount] ?? 45_000;
+}
+
+export function softResetDoom(currentDoom: number): number {
+  return Math.round((currentDoom + INITIAL_DOOM) / 2);
+}
+
+export function doomColor(pct: number): string {
+  if (pct >= 80) return "#f43f5e";
+  if (pct >= 50) return "#f59e0b";
+  return "#22c55e";
+}
+
 export const PRESET_AVATARS = [
   { id: "skull", label: "Hollow Skull", glyph: "💀", accent: "#ef4444" },
   { id: "raven", label: "Carrion Crow", glyph: "🐦‍⬛", accent: "#a855f7" },
