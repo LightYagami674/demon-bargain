@@ -1,4 +1,5 @@
 import { TypeSafeClient, choice, noul, score } from "@typesafe-ai/sdk";
+import { NOOP_LOGGER, type Logger } from "./logger.js";
 
 export const ENTITY_MOODS = [
   "SADIST",
@@ -127,17 +128,91 @@ export interface JevEvaluator {
   ): Promise<PickInterceptedWhisperResult>;
 }
 
-export class TypeSafeJevEvaluator implements JevEvaluator {
-  private readonly client: TypeSafeClient;
+export interface TypeSafeJevClientLike {
+  systemOne: (
+    request: Parameters<TypeSafeClient["systemOne"]>[0],
+    options?: Parameters<TypeSafeClient["systemOne"]>[1],
+  ) => Promise<{ answers: Record<string, unknown> }>;
+}
 
-  constructor(apiKey: string) {
-    this.client = new TypeSafeClient({
-      apiKey,
-      defaultModel: "jev-latest",
-      timeout: 2_500,
-      retry: { maxRetries: 2 },
-      compression: false,
-    });
+export interface TypeSafeJevEvaluatorOptions {
+  logger?: Logger;
+  clock?: () => number;
+  client?: TypeSafeJevClientLike;
+}
+
+function extractErrorMeta(err: unknown): {
+  errorName: string;
+  errorCode: string | number;
+} {
+  if (err && typeof err === "object") {
+    const record = err as {
+      name?: unknown;
+      code?: unknown;
+      status?: unknown;
+    };
+    const errorName =
+      typeof record.name === "string" && record.name.length > 0
+        ? record.name
+        : "Error";
+    const errorCode =
+      typeof record.code === "string" || typeof record.code === "number"
+        ? record.code
+        : typeof record.status === "number"
+          ? record.status
+          : "UNKNOWN";
+    return { errorName, errorCode };
+  }
+  return { errorName: "UnknownError", errorCode: "UNKNOWN" };
+}
+
+export class TypeSafeJevEvaluator implements JevEvaluator {
+  private readonly client: TypeSafeJevClientLike;
+  private readonly logger: Logger;
+  private readonly clock: () => number;
+
+  constructor(apiKey: string, options: TypeSafeJevEvaluatorOptions = {}) {
+    this.logger = options.logger ?? NOOP_LOGGER;
+    this.clock = options.clock ?? (() => Date.now());
+    this.client =
+      options.client ??
+      new TypeSafeClient({
+        apiKey,
+        defaultModel: "jev-latest",
+        timeout: 2_500,
+        retry: { maxRetries: 2 },
+        compression: false,
+      });
+  }
+
+  private async runTimedCall<T>(
+    operation: "judgeMessage" | "pickInterceptedWhisper",
+    roundId: string,
+    meta: Record<string, unknown>,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const startedAt = this.clock();
+    try {
+      const result = await fn();
+      this.logger.info("jev_call_completed", {
+        operation,
+        roundId,
+        latencyMs: Math.max(0, this.clock() - startedAt),
+        ...meta,
+      });
+      return result;
+    } catch (err) {
+      const { errorName, errorCode } = extractErrorMeta(err);
+      this.logger.error("jev_call_failed", {
+        operation,
+        roundId,
+        latencyMs: Math.max(0, this.clock() - startedAt),
+        errorName,
+        errorCode,
+        ...meta,
+      });
+      throw err;
+    }
   }
 
   async judgeMessage(input: JudgeMessageInput): Promise<JudgeMessageResult> {
@@ -165,43 +240,54 @@ export class TypeSafeJevEvaluator implements JevEvaluator {
       );
     }
 
-    const result = await this.client.systemOne({
-      state: {
+    const result = await this.runTimedCall(
+      "judgeMessage",
+      input.roundId,
+      {
         entityMood: input.entityMood,
-        moodRubric: input.moodRubric,
-        livingPlayers: input.livingPlayers.map((p) => `${p.name} (${p.doom}% Doom)`),
-        recentContext: input.recentMessages.map(
-          (m) => `${m.speakerName}: ${m.text}`,
-        ),
-        speaker: input.speaker.name,
-        playerMessage: input.messageText,
-        ...(activeCurses.length > 0 ? { activeCurses } : {}),
+        curseCount: activeCurses.length,
       },
-      questions: {
-        persuasiveness: score(
-          `How compelling is ${input.speaker.name}'s plea under the ${input.entityMood} mood rubric?`,
-          [
-            "Completely unconvincing, irritating, or counter-productive",
-            "Weak, generic, or poorly aligned with the mood",
-            "Passable, neutral effort",
-            "Strong, tense, and well-aligned with the mood",
-            "Masterful, gripping, and perfectly aligned with the mood",
-          ],
-        ),
-        targetBlamed: choice(
-          `Which living player is ${input.speaker.name} blaming or accusing in this message?`,
-          blameCriteria,
-        ),
-        isLowEffortSpam: noul(
-          "Is the message low-effort spam, gibberish, keyboard mashing, or empty filler?",
-          {
-            true: "Repeated characters, random letters, or zero-effort filler",
-            false: "A coherent in-game plea or accusation",
+      () =>
+        this.client.systemOne({
+          state: {
+            entityMood: input.entityMood,
+            moodRubric: input.moodRubric,
+            livingPlayers: input.livingPlayers.map(
+              (p) => `${p.name} (${p.doom}% Doom)`,
+            ),
+            recentContext: input.recentMessages.map(
+              (m) => `${m.speakerName}: ${m.text}`,
+            ),
+            speaker: input.speaker.name,
+            playerMessage: input.messageText,
+            ...(activeCurses.length > 0 ? { activeCurses } : {}),
           },
-        ),
-        ...curseQuestions,
-      },
-    });
+          questions: {
+            persuasiveness: score(
+              `How compelling is ${input.speaker.name}'s plea under the ${input.entityMood} mood rubric?`,
+              [
+                "Completely unconvincing, irritating, or counter-productive",
+                "Weak, generic, or poorly aligned with the mood",
+                "Passable, neutral effort",
+                "Strong, tense, and well-aligned with the mood",
+                "Masterful, gripping, and perfectly aligned with the mood",
+              ],
+            ),
+            targetBlamed: choice(
+              `Which living player is ${input.speaker.name} blaming or accusing in this message?`,
+              blameCriteria,
+            ),
+            isLowEffortSpam: noul(
+              "Is the message low-effort spam, gibberish, keyboard mashing, or empty filler?",
+              {
+                true: "Repeated characters, random letters, or zero-effort filler",
+                false: "A coherent in-game plea or accusation",
+              },
+            ),
+            ...curseQuestions,
+          },
+        }),
+    );
 
     const answers = result.answers as Record<string, unknown>;
     const persuasiveness = answers.persuasiveness as { score: number };
@@ -247,20 +333,29 @@ export class TypeSafeJevEvaluator implements JevEvaluator {
       criteria[c.id] = `${c.senderName} -> ${c.targetName}: "${c.text}"`;
     }
 
-    const result = await this.client.systemOne({
-      state: {
+    const result = await this.runTimedCall(
+      "pickInterceptedWhisper",
+      input.roundId,
+      {
         entityMood: input.entityMood,
-        whispers: slice.map(
-          (c) => `[${c.id}] ${c.senderName} to ${c.targetName}: ${c.text}`,
-        ),
+        candidateCount: slice.length,
       },
-      questions: {
-        picked: choice(
-          "Which private Whisper is the most treacherous, dramatic, or incriminating to leak publicly?",
-          criteria,
-        ),
-      },
-    });
+      () =>
+        this.client.systemOne({
+          state: {
+            entityMood: input.entityMood,
+            whispers: slice.map(
+              (c) => `[${c.id}] ${c.senderName} to ${c.targetName}: ${c.text}`,
+            ),
+          },
+          questions: {
+            picked: choice(
+              "Which private Whisper is the most treacherous, dramatic, or incriminating to leak publicly?",
+              criteria,
+            ),
+          },
+        }),
+    );
 
     const picked = result.answers.picked as { choice: string };
     return {

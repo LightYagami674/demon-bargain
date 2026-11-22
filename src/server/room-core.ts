@@ -48,6 +48,7 @@ import {
   type RoomPhase,
   type ServerMessage,
 } from "../shared/protocol.js";
+import { NOOP_LOGGER, type Logger } from "./logger.js";
 
 export interface RoomTransport {
   send(connectionId: string, payload: string): void;
@@ -71,6 +72,7 @@ export interface RoomCoreOptions {
   generateId?: () => string;
   random?: () => number;
   jevEvaluator?: JevEvaluator;
+  logger?: Logger;
 }
 
 interface InternalPlayer {
@@ -125,6 +127,7 @@ export class RoomCore {
   private readonly generateId: () => string;
   private readonly random: () => number;
   private readonly jevEvaluator?: JevEvaluator;
+  private readonly logger: Logger;
 
   private phase: RoomPhase = "WAITING";
   private matchPhase: MatchPhase | null = null;
@@ -161,6 +164,7 @@ export class RoomCore {
     this.generateId = options.generateId ?? (() => crypto.randomUUID());
     this.random = options.random ?? (() => Math.random());
     this.jevEvaluator = options.jevEvaluator;
+    this.logger = options.logger ?? NOOP_LOGGER;
 
     const raw = this.storage.load();
     if (raw) {
@@ -199,6 +203,10 @@ export class RoomCore {
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
+    } else {
+      this.logger.info("room_created", {
+        roomCode: this.roomCode,
+      });
     }
   }
 
@@ -322,6 +330,12 @@ export class RoomCore {
     this.persist();
     this.rescheduleAlarm();
     this.broadcastPlayers();
+    this.logger.info("player_disconnected", {
+      roomCode: this.roomCode,
+      playerId: player.id,
+      phase: this.phase,
+      alive: player.alive,
+    });
   }
 
   onAlarm(): void {
@@ -337,6 +351,11 @@ export class RoomCore {
       this.lastActivityAt + ROOM_IDLE_CLEANUP_MS <= now;
 
     if (emptyExpired || idleExpired) {
+      this.logger.info("room_cleaned_up", {
+        roomCode: this.roomCode,
+        reason: emptyExpired ? "empty_timeout" : "idle_timeout",
+        phase: this.phase,
+      });
       this.wipeRoom();
       return;
     }
@@ -758,6 +777,11 @@ export class RoomCore {
       `Round 1 begins. ${hint}`,
       now,
     );
+    this.logger.info("match_started", {
+      roomCode: this.roomCode,
+      playerCount: this.players.length,
+      totalRounds: this.totalRounds,
+    });
   }
 
   private handleCastCurse(
@@ -1286,6 +1310,12 @@ export class RoomCore {
       "The Entity fell silent — Match aborted",
       now,
     );
+    this.logger.error("match_ended", {
+      roomCode: this.roomCode,
+      endReason: this.endReason,
+      round: this.round,
+      winnerId: null,
+    });
   }
 
   private handleLeaveRoom(connectionId: string): void {
@@ -1348,6 +1378,12 @@ export class RoomCore {
     this.lastActivityAt = now;
     this.persist();
     this.broadcastPhaseChanged(now);
+    this.logger.info("match_ended", {
+      roomCode: this.roomCode,
+      endReason: this.endReason,
+      round: this.round,
+      winnerId: this.winnerId,
+    });
   }
 
   private transferHostFrom(departingPlayerId: string): void {
