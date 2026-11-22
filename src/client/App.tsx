@@ -11,6 +11,7 @@ import {
 } from "../shared/constants.js";
 import {
   ServerMessageSchema,
+  type ActiveCurse,
   type ClientMessage,
   type ErrorCode,
   type FeedItem,
@@ -67,6 +68,8 @@ interface RoomSnapshotState {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   chatCooldownEndsAt: number | null;
+  activeCurses: ActiveCurse[];
+  curseCooldownEndsAt: number | null;
 }
 
 export function App({ createSocket = createPartyRoomSocket }: AppProps) {
@@ -376,6 +379,8 @@ function RoomView({
             endReason: msg.endReason ?? null,
             feed: msg.feed ?? [],
             chatCooldownEndsAt: msg.chatCooldownEndsAt ?? null,
+            activeCurses: msg.activeCurses ?? [],
+            curseCooldownEndsAt: msg.curseCooldownEndsAt ?? null,
           });
           break;
         }
@@ -406,6 +411,12 @@ function RoomView({
               sacrificedPlayerId: msg.sacrificedPlayerId ?? null,
               winnerId: msg.winnerId ?? null,
               endReason: msg.endReason ?? null,
+              activeCurses:
+                msg.matchPhase === "ROUND_ACTIVE" ? prev.activeCurses : [],
+              curseCooldownEndsAt:
+                msg.matchPhase === "ROUND_INTRO"
+                  ? null
+                  : prev.curseCooldownEndsAt,
             };
           });
           break;
@@ -451,6 +462,32 @@ function RoomView({
               return upd ? { ...p, doom: upd.doom } : p;
             });
             return { ...prev, players: nextPlayers };
+          });
+          break;
+        }
+        case "curse_applied": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            if (prev.activeCurses.some((c) => c.id === msg.curse.id)) {
+              return prev;
+            }
+            return {
+              ...prev,
+              activeCurses: [...prev.activeCurses, msg.curse],
+            };
+          });
+          break;
+        }
+        case "curse_resolved": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const resolvedIds = new Set(msg.results.map((r) => r.curseId));
+            return {
+              ...prev,
+              activeCurses: prev.activeCurses.filter(
+                (c) => !resolvedIds.has(c.id),
+              ),
+            };
           });
           break;
         }
@@ -639,10 +676,15 @@ function RoomView({
         endReason={snapshot.endReason}
         feed={snapshot.feed}
         serverCooldownEndsAt={snapshot.chatCooldownEndsAt}
+        activeCurses={snapshot.activeCurses}
+        curseCooldownEndsAt={snapshot.curseCooldownEndsAt}
         reconnecting={!socketOpen}
         errorBanner={errorBanner}
         onDismissError={() => setErrorBanner(null)}
         onSendChat={(text) => sendMessage({ type: "send_chat", text })}
+        onCastCurse={(targetPlayerId, word) =>
+          sendMessage({ type: "cast_curse", targetPlayerId, word })
+        }
         onLeave={handleLeave}
       />
     );

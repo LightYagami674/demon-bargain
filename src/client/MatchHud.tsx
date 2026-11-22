@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   CHAT_COOLDOWN_MS,
+  CURSE_COOLDOWN_MS,
+  CURSE_SUGGESTIONS,
   MAX_CHAT_LENGTH,
   MIN_CHAT_LENGTH,
   PRESET_AVATARS,
   doomColor,
+  isValidCurseWord,
 } from "../shared/constants.js";
 import type {
+  ActiveCurse,
   ErrorCode,
   FeedItem,
   MatchEndReason,
@@ -36,10 +40,13 @@ export interface MatchHudProps {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   serverCooldownEndsAt: number | null;
+  activeCurses?: ActiveCurse[];
+  curseCooldownEndsAt?: number | null;
   reconnecting?: boolean;
   errorBanner: { code?: ErrorCode; message: string } | null;
   onDismissError: () => void;
   onSendChat: (text: string) => void;
+  onCastCurse?: (targetPlayerId: string, word: string) => void;
   onLeave: () => void;
 }
 
@@ -78,15 +85,22 @@ export function MatchHud({
   endReason,
   feed,
   serverCooldownEndsAt,
+  activeCurses = [],
+  curseCooldownEndsAt = null,
   reconnecting = false,
   errorBanner,
   onDismissError,
   onSendChat,
+  onCastCurse,
   onLeave,
 }: MatchHudProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [draft, setDraft] = useState("");
+  const [curseDraft, setCurseDraft] = useState("");
+  const [curseTargetId, setCurseTargetId] = useState<string | null>(null);
   const [localCooldownEndsAt, setLocalCooldownEndsAt] = useState<number>(0);
+  const [localCurseCooldownEndsAt, setLocalCurseCooldownEndsAt] =
+    useState<number>(0);
   const [validationNote, setValidationNote] = useState<string | null>(null);
   const [impactNow, setImpactNow] = useState(false);
   const [staticFlashActive, setStaticFlashActive] = useState(false);
@@ -250,6 +264,8 @@ export function MatchHud({
 
   const canSpeak =
     phase === "IN_MATCH" && matchPhase === "ROUND_ACTIVE" && isAlive;
+  const canCurse =
+    phase === "IN_MATCH" && matchPhase === "ROUND_ACTIVE" && !isAlive;
 
   const effectiveCooldownEndsAt = Math.max(
     localCooldownEndsAt,
@@ -257,6 +273,32 @@ export function MatchHud({
   );
   const cooldownRemainingMs = Math.max(0, effectiveCooldownEndsAt - nowMs);
   const inCooldown = cooldownRemainingMs > 0;
+
+  const effectiveCurseCooldownEndsAt = Math.max(
+    localCurseCooldownEndsAt,
+    curseCooldownEndsAt !== null ? curseCooldownEndsAt - clockOffsetMs : 0,
+  );
+  const curseCooldownRemainingMs = Math.max(
+    0,
+    effectiveCurseCooldownEndsAt - nowMs,
+  );
+  const inCurseCooldown = curseCooldownRemainingMs > 0;
+
+  const selectedCurseTarget = curseTargetId
+    ? players.find((p) => p.id === curseTargetId && p.alive) ?? null
+    : null;
+  const myActiveCurses = isAlive
+    ? activeCurses.filter((c) => c.targetPlayerId === selfPlayerId)
+    : [];
+
+  useEffect(() => {
+    if (matchPhase !== "ROUND_ACTIVE") {
+      setCurseTargetId(null);
+      if (matchPhase === "ROUND_INTRO") {
+        setLocalCurseCooldownEndsAt(0);
+      }
+    }
+  }, [matchPhase]);
 
   const countdown = formatCountdown(phaseEndsAt, clockOffsetMs, nowMs);
 
@@ -287,6 +329,32 @@ export function MatchHud({
     setLocalCooldownEndsAt(Date.now() + CHAT_COOLDOWN_MS);
     setDraft("");
     onSendChat(trimmed);
+  };
+
+  const handleCurseSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canCurse || !onCastCurse) return;
+    if (!selectedCurseTarget) {
+      setValidationNote("Tap a living player on the left rail to Curse.");
+      return;
+    }
+    if (inCurseCooldown) {
+      setValidationNote(
+        `Wait ${Math.ceil(curseCooldownRemainingMs / 1000)}s before casting again.`,
+      );
+      return;
+    }
+    const trimmed = curseDraft.trim();
+    if (!isValidCurseWord(trimmed)) {
+      setValidationNote(
+        "Curse must be 1 word (2–20 letters, optional internal - or ').",
+      );
+      return;
+    }
+    setValidationNote(null);
+    setLocalCurseCooldownEndsAt(Date.now() + CURSE_COOLDOWN_MS);
+    setCurseDraft("");
+    onCastCurse(selectedCurseTarget.id, trimmed);
   };
 
   let placeholder = "Plead for your life...";
@@ -406,14 +474,60 @@ export function MatchHud({
             const isSelf = p.id === selfPlayerId;
             const ringColor = p.alive ? doomColor(p.doom) : "#52525b";
             const dashOffset = RING_CIRC * (1 - p.doom / 100);
+            const isCurseSelectable = canCurse && p.alive && !isSelf;
+            const isCurseSelected =
+              isCurseSelectable && selectedCurseTarget?.id === p.id;
+            const targetCurseCount = activeCurses.filter(
+              (c) => c.targetPlayerId === p.id,
+            ).length;
 
             return (
               <div
                 key={p.id}
-                className={`vb-node w-[52px] py-1 px-0.5 rounded-[10px] border border-transparent flex flex-col items-center gap-0.5 ${
+                data-testid={`rail-player-${p.id}`}
+                role={isCurseSelectable ? "button" : undefined}
+                tabIndex={isCurseSelectable ? 0 : undefined}
+                onClick={
+                  isCurseSelectable
+                    ? () => {
+                        setCurseTargetId((prev) =>
+                          prev === p.id ? null : p.id,
+                        );
+                        if (validationNote) setValidationNote(null);
+                      }
+                    : undefined
+                }
+                onKeyDown={
+                  isCurseSelectable
+                    ? (e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setCurseTargetId((prev) =>
+                            prev === p.id ? null : p.id,
+                          );
+                        }
+                      }
+                    : undefined
+                }
+                className={`vb-node w-[52px] py-1 px-0.5 rounded-[10px] border flex flex-col items-center gap-0.5 relative ${
                   !p.alive ? "ghost opacity-45" : ""
-                } ${isSelf ? "bg-zinc-900/70" : ""}`}
+                } ${
+                  isCurseSelected
+                    ? "curse-selected border-rose-500 bg-rose-950/50"
+                    : isSelf
+                      ? "border-transparent bg-zinc-900/70"
+                      : "border-transparent"
+                } ${isCurseSelectable ? "cursor-pointer hover:border-rose-700/60" : ""}`}
               >
+                {targetCurseCount > 0 && (
+                  <span
+                    data-testid={`rail-curse-badge-${p.id}`}
+                    className="absolute -top-1 -right-0.5 z-10 rounded-full bg-rose-700 px-1 text-[8.5px] font-bold text-white leading-tight"
+                    title={`${targetCurseCount} active Curse(s)`}
+                  >
+                    🩸{targetCurseCount > 1 ? targetCurseCount : ""}
+                  </span>
+                )}
                 <div className="vb-ring-wrap relative w-[38px] h-[38px] flex items-center justify-center">
                   <svg
                     width="38"
@@ -545,37 +659,122 @@ export function MatchHud({
             <div ref={feedEndRef} />
           </div>
 
-          <form
-            onSubmit={handleSubmit}
-            className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1"
-          >
-            {validationNote && (
-              <p className="text-[11px] text-amber-300 px-1">{validationNote}</p>
-            )}
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                disabled={!canSpeak}
-                maxLength={MAX_CHAT_LENGTH}
-                value={draft}
-                onChange={(e) => {
-                  setDraft(e.target.value);
-                  if (validationNote) setValidationNote(null);
-                }}
-                placeholder={placeholder}
-                className="composer-input flex-1 min-w-0 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-100 placeholder:text-zinc-500 disabled:opacity-50 focus:border-rose-500 focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={!canSpeak}
-                className="rounded-xl bg-rose-700 hover:bg-rose-600 disabled:bg-zinc-800 disabled:text-zinc-500 px-3.5 py-2 text-sm font-bold text-white transition-colors shrink-0"
-              >
-                {inCooldown
-                  ? `${Math.ceil(cooldownRemainingMs / 1000)}s`
-                  : "Send"}
-              </button>
+          {myActiveCurses.length > 0 && (
+            <div
+              data-testid="active-curses-bar"
+              className="shrink-0 z-[24] border-t border-rose-800/70 bg-rose-950/75 px-3 py-1.5 flex items-center gap-1.5 flex-wrap"
+            >
+              <span className="text-[10.5px] font-bold uppercase tracking-wider text-rose-300">
+                Cursed — weave into next plea:
+              </span>
+              {myActiveCurses.map((c) => (
+                <span
+                  key={c.id}
+                  className="rounded-full border border-rose-500/80 bg-rose-900/80 px-2 py-0.5 font-mono text-[11px] font-bold text-rose-100"
+                >
+                  {c.word}
+                </span>
+              ))}
             </div>
-          </form>
+          )}
+
+          {!isAlive && phase === "IN_MATCH" ? (
+            <form
+              data-testid="curse-composer"
+              onSubmit={handleCurseSubmit}
+              className="composer-wrap shrink-0 z-[25] bg-[#140d11]/98 border-t border-rose-900/50 px-2.5 py-2 space-y-1.5"
+            >
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <span className="text-[11px] font-semibold text-rose-300">
+                  {selectedCurseTarget
+                    ? `Cursing: ${selectedCurseTarget.name}`
+                    : "👻 Tap a living player on the left rail to Curse"}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+                {CURSE_SUGGESTIONS.map((chip) => (
+                  <button
+                    key={chip}
+                    type="button"
+                    disabled={!canCurse}
+                    onClick={() => {
+                      setCurseDraft(chip);
+                      if (validationNote) setValidationNote(null);
+                    }}
+                    className="shrink-0 rounded-full border border-rose-800/70 bg-rose-950/60 hover:bg-rose-900/70 disabled:opacity-40 px-2.5 py-0.5 text-[11px] font-semibold text-rose-200 transition-colors"
+                  >
+                    {chip}
+                  </button>
+                ))}
+              </div>
+              {validationNote && (
+                <p className="text-[11px] text-amber-300 px-1">
+                  {validationNote}
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  disabled={!canCurse}
+                  maxLength={20}
+                  value={curseDraft}
+                  onChange={(e) => {
+                    setCurseDraft(e.target.value);
+                    if (validationNote) setValidationNote(null);
+                  }}
+                  placeholder={
+                    canCurse
+                      ? "Cursed word (2–20 letters)..."
+                      : "You are a Ghost — Curses unlock when the round begins..."
+                  }
+                  className="composer-input flex-1 min-w-0 rounded-xl border border-rose-800/70 bg-[#1d1016] px-3 py-2 text-base text-zinc-100 placeholder:text-zinc-500 disabled:opacity-50 focus:border-rose-500 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={!canCurse}
+                  className="rounded-xl bg-rose-700 hover:bg-rose-600 disabled:bg-zinc-800 disabled:text-zinc-500 px-3.5 py-2 text-sm font-bold text-white transition-colors shrink-0"
+                >
+                  {inCurseCooldown
+                    ? `${Math.ceil(curseCooldownRemainingMs / 1000)}s`
+                    : "Cast Curse"}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form
+              onSubmit={handleSubmit}
+              className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1"
+            >
+              {validationNote && (
+                <p className="text-[11px] text-amber-300 px-1">
+                  {validationNote}
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  disabled={!canSpeak}
+                  maxLength={MAX_CHAT_LENGTH}
+                  value={draft}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    if (validationNote) setValidationNote(null);
+                  }}
+                  placeholder={placeholder}
+                  className="composer-input flex-1 min-w-0 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-100 placeholder:text-zinc-500 disabled:opacity-50 focus:border-rose-500 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={!canSpeak}
+                  className="rounded-xl bg-rose-700 hover:bg-rose-600 disabled:bg-zinc-800 disabled:text-zinc-500 px-3.5 py-2 text-sm font-bold text-white transition-colors shrink-0"
+                >
+                  {inCooldown
+                    ? `${Math.ceil(cooldownRemainingMs / 1000)}s`
+                    : "Send"}
+                </button>
+              </div>
+            </form>
+          )}
         </section>
       </div>
     </div>

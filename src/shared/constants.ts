@@ -28,6 +28,21 @@ export const MIN_CHAT_LENGTH = 2;
 export const MAX_CHAT_LENGTH = 200;
 export const MAX_FEED_ITEMS = 200;
 
+export const CURSE_COOLDOWN_MS = 15_000;
+export const CURSE_FAIL_DOOM_PENALTY = 12;
+export const CURSE_SUGGESTIONS = [
+  "mercy",
+  "candle",
+  "blood",
+  "hollow",
+  "silence",
+] as const;
+export const CURSE_WORD_REGEX = /^(?=.{2,20}$)[a-zA-Z]+(?:[-'][a-zA-Z]+)*$/;
+
+export function isValidCurseWord(word: string): boolean {
+  return CURSE_WORD_REGEX.test(word);
+}
+
 const ROUND_DURATION_BY_LIVING_MS: Record<number, number> = {
   6: 90_000,
   5: 75_000,
