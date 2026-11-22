@@ -488,7 +488,9 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     // Advance 60_000ms -> ROUND_RESOLVING (2000ms)
     h.clearMessages();
     h.advanceTime(60_000);
-    expect(h.lastMessageFor("c1")).toMatchObject({
+    expect(
+      h.messagesFor("c1").find((m) => m.type === "phase_changed"),
+    ).toMatchObject({
       type: "phase_changed",
       phase: "IN_MATCH",
       matchPhase: "ROUND_RESOLVING",
@@ -519,7 +521,9 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     // Advance 4500ms -> POST_MATCH with Alice as winner
     h.clearMessages();
     h.advanceTime(4500);
-    expect(h.lastMessageFor("c1")).toMatchObject({
+    expect(
+      h.messagesFor("c1").find((m) => m.type === "phase_changed"),
+    ).toMatchObject({
       type: "phase_changed",
       phase: "POST_MATCH",
       matchPhase: null,

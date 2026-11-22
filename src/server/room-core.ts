@@ -26,12 +26,16 @@ import {
 } from "../shared/constants.js";
 import {
   MOOD_RUBRICS,
-  pickMoodHint,
   pickNextMood,
   type EntityMood,
   type JevEvaluator,
   type JudgeMessageResult,
 } from "./jev.js";
+import {
+  EntityCopyEngine,
+  type SerializedCopyEngineState,
+} from "./copy/copy-engine.js";
+import { POST_MATCH_JUDGE_ERROR } from "./copy/script-bank.js";
 import {
   ClientMessageSchema,
   type ClientMessage,
@@ -97,7 +101,7 @@ interface PersistedRoomState {
   entityMood?: EntityMood;
   previousRoundMood?: EntityMood | null;
   nextMoodRotationAt?: number | null;
-  usedMoodHints?: string[];
+  copyState?: SerializedCopyEngineState;
   roundId?: string;
   isSuddenDeath?: boolean;
   roundPublicMessages?: Array<{ speakerName: string; text: string }>;
@@ -130,7 +134,7 @@ export class RoomCore {
   private entityMood: EntityMood = "SADIST";
   private previousRoundMood: EntityMood | null = null;
   private nextMoodRotationAt: number | null = null;
-  private usedMoodHints = new Set<string>();
+  private copyEngine: EntityCopyEngine;
   private roundId = "";
   private isSuddenDeath = false;
   private roundPublicMessages: Array<{ speakerName: string; text: string }> = [];
@@ -150,6 +154,7 @@ export class RoomCore {
     this.generateId = options.generateId ?? (() => crypto.randomUUID());
     this.random = options.random ?? (() => Math.random());
     this.jevEvaluator = options.jevEvaluator;
+    this.copyEngine = new EntityCopyEngine(this.random);
 
     const raw = this.storage.load();
     if (raw) {
@@ -172,7 +177,9 @@ export class RoomCore {
         this.entityMood = parsed.entityMood ?? "SADIST";
         this.previousRoundMood = parsed.previousRoundMood ?? null;
         this.nextMoodRotationAt = parsed.nextMoodRotationAt ?? null;
-        this.usedMoodHints = new Set(parsed.usedMoodHints ?? []);
+        if (parsed.copyState) {
+          this.copyEngine.restore(parsed.copyState);
+        }
         this.roundId = parsed.roundId ?? "";
         this.isSuddenDeath = parsed.isSuddenDeath ?? false;
         this.roundPublicMessages = parsed.roundPublicMessages ?? [];
@@ -354,7 +361,7 @@ export class RoomCore {
         }
         this.emitEntityAnnouncement(
           "SACRIFICE_DISCONNECT",
-          `${p.name} abandoned the ritual and was claimed by the Entity.`,
+          this.copyEngine.drawBeat("SACRIFICE_DISCONNECT", { player: p.name }),
           now,
         );
         changed = true;
@@ -382,7 +389,7 @@ export class RoomCore {
         now >= this.nextMoodRotationAt
       ) {
         this.entityMood = pickNextMood(this.entityMood, this.random);
-        const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+        const hint = this.copyEngine.drawMoodHint(this.entityMood);
         this.nextMoodRotationAt =
           this.phaseEndsAt !== null && now + MOOD_ROTATION_MS < this.phaseEndsAt
             ? now + MOOD_ROTATION_MS
@@ -422,8 +429,10 @@ export class RoomCore {
           : ROUND_RESOLVING_MS;
       this.phaseEndsAt = now + resolvingMs;
       this.resolvingCapAt = now + ROUND_RESOLVING_MAX_MS;
+      const resolvingText = this.copyEngine.drawBeat("ROUND_RESOLVING");
       this.persist();
       this.broadcastPhaseChanged(now);
+      this.emitEntityAnnouncement("ROUND_RESOLVING", resolvingText, now);
       return;
     }
 
@@ -440,12 +449,12 @@ export class RoomCore {
       const maxDoom = Math.max(...living.map((p) => p.doom));
       const tied = living.filter((p) => p.doom === maxDoom);
       if (tied.length === 1) {
-        this.sacrificePlayer(tied[0]!, now);
+        this.sacrificePlayer(tied[0]!, now, "TIMER");
       } else if (!this.isSuddenDeath) {
         this.triggerSuddenDeath(now);
       } else {
         const victim = this.breakTieLongestSilentThenRandom(tied);
-        this.sacrificePlayer(victim, now);
+        this.sacrificePlayer(victim, now, "TIEBREAK");
       }
       return;
     }
@@ -466,7 +475,8 @@ export class RoomCore {
       this.resolvingCapAt = null;
       this.entityMood = pickNextMood(this.previousRoundMood, this.random);
       this.previousRoundMood = this.entityMood;
-      const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+      const introText = this.copyEngine.drawBeat("ROUND_INTRO_NEXT");
+      const hint = this.copyEngine.drawMoodHint(this.entityMood);
       for (const p of living) {
         p.doom = softResetDoom(p.doom);
       }
@@ -474,11 +484,8 @@ export class RoomCore {
       this.phaseEndsAt = now + ROUND_INTRO_MS;
       this.persist();
       this.broadcastPhaseChanged(now);
-      this.emitEntityAnnouncement(
-        "ROUND_INTRO",
-        `Round ${this.round} begins. ${hint}`,
-        now,
-      );
+      this.emitEntityAnnouncement("ROUND_INTRO", introText, now);
+      this.emitEntityAnnouncement("MOOD_HINT", hint, now);
     }
   }
 
@@ -699,7 +706,7 @@ export class RoomCore {
     this.winnerId = null;
     this.endReason = null;
     this.feed = [];
-    this.usedMoodHints.clear();
+    this.copyEngine.reset();
     this.isSuddenDeath = false;
     this.roundId = this.generateId();
     this.roundPublicMessages = [];
@@ -708,7 +715,8 @@ export class RoomCore {
     this.resolvingCapAt = null;
     this.entityMood = pickNextMood(null, this.random);
     this.previousRoundMood = this.entityMood;
-    const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+    const introText = this.copyEngine.drawBeat("ROUND_INTRO_FIRST");
+    const hint = this.copyEngine.drawMoodHint(this.entityMood);
     this.phaseEndsAt = now + ROUND_INTRO_MS;
 
     for (const p of this.players) {
@@ -720,11 +728,8 @@ export class RoomCore {
     this.persist();
     this.rescheduleAlarm();
     this.broadcastPhaseChanged(now);
-    this.emitEntityAnnouncement(
-      "ROUND_INTRO",
-      `Round 1 begins. ${hint}`,
-      now,
-    );
+    this.emitEntityAnnouncement("ROUND_INTRO", introText, now);
+    this.emitEntityAnnouncement("MOOD_HINT", hint, now);
   }
 
   private handleSendChat(connectionId: string, rawText: string): void {
@@ -927,27 +932,32 @@ export class RoomCore {
     if (emitSpamMockery) {
       this.emitEntityAnnouncement(
         "SPAM_MOCKERY",
-        `${speaker.name}, your empty babble only feeds the altar.`,
+        this.copyEngine.drawBeat("SPAM_MOCKERY", { player: speaker.name }),
         now,
       );
+      this.persist();
     }
 
     const maxed = this.players.filter((p) => p.alive && p.doom >= 100);
     if (maxed.length === 1) {
-      this.sacrificePlayer(maxed[0]!, now);
+      this.sacrificePlayer(maxed[0]!, now, "SPIKE");
       this.rescheduleAlarm();
     } else if (maxed.length > 1) {
       if (!this.isSuddenDeath) {
         this.triggerSuddenDeath(now);
       } else {
         const victim = this.breakTieLongestSilentThenRandom(maxed);
-        this.sacrificePlayer(victim, now);
+        this.sacrificePlayer(victim, now, "TIEBREAK");
       }
       this.rescheduleAlarm();
     }
   }
 
-  private sacrificePlayer(victim: InternalPlayer, now: number): void {
+  private sacrificePlayer(
+    victim: InternalPlayer,
+    now: number,
+    cause: "TIMER" | "SPIKE" | "TIEBREAK",
+  ): void {
     victim.alive = false;
     this.sacrificedPlayerId = victim.id;
     this.isSuddenDeath = false;
@@ -956,13 +966,16 @@ export class RoomCore {
     this.roundId = this.generateId();
     this.matchPhase = "SACRIFICE_REVEAL";
     this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
+    const pool =
+      cause === "SPIKE"
+        ? "SACRIFICE_SPIKE"
+        : cause === "TIEBREAK"
+          ? "SACRIFICE_TIEBREAK"
+          : "SACRIFICE_TIMER";
+    const text = this.copyEngine.drawBeat(pool, { player: victim.name });
     this.persist();
     this.broadcastPhaseChanged(now);
-    this.emitEntityAnnouncement(
-      "SACRIFICE_REVEAL",
-      `${victim.name} has been claimed by the Entity.`,
-      now,
-    );
+    this.emitEntityAnnouncement("SACRIFICE_REVEAL", text, now);
   }
 
   private triggerSuddenDeath(now: number): void {
@@ -979,17 +992,15 @@ export class RoomCore {
     this.resolvingCapAt = null;
     this.entityMood = pickNextMood(this.entityMood, this.random);
     this.previousRoundMood = this.entityMood;
-    const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+    const sdText = this.copyEngine.drawBeat("ROUND_INTRO_SUDDEN_DEATH");
+    const hint = this.copyEngine.drawMoodHint(this.entityMood);
 
     this.matchPhase = "ROUND_ACTIVE";
     this.phaseEndsAt = now + SUDDEN_DEATH_DURATION_MS;
     this.persist();
     this.broadcastPhaseChanged(now);
-    this.emitEntityAnnouncement(
-      "SUDDEN_DEATH",
-      `A tie for the altar! 30 seconds of sudden death. ${hint}`,
-      now,
-    );
+    this.emitEntityAnnouncement("SUDDEN_DEATH", sdText, now);
+    this.emitEntityAnnouncement("MOOD_HINT", hint, now);
   }
 
   private breakTieLongestSilentThenRandom(
@@ -1027,7 +1038,7 @@ export class RoomCore {
     this.broadcastPhaseChanged(now);
     this.emitEntityAnnouncement(
       "POST_MATCH_JUDGE_ERROR",
-      "The Entity fell silent — Match aborted",
+      POST_MATCH_JUDGE_ERROR,
       now,
     );
   }
@@ -1051,7 +1062,7 @@ export class RoomCore {
       const now = this.clock();
       this.emitEntityAnnouncement(
         "SACRIFICE_DISCONNECT",
-        `${player.name} fled the ritual and was claimed by the Entity.`,
+        this.copyEngine.drawBeat("SACRIFICE_DISCONNECT", { player: player.name }),
         now,
       );
       const living = this.players.filter((p) => p.alive);
@@ -1090,8 +1101,49 @@ export class RoomCore {
     this.winnerId = living[0]?.id ?? null;
     this.endReason = living.length === 1 ? "SURVIVOR" : "ALL_CLAIMED";
     this.lastActivityAt = now;
+    const closingText = this.drawPostMatchBeat(
+      this.endReason,
+      living[0]?.name,
+    );
     this.persist();
     this.broadcastPhaseChanged(now);
+    this.emitEntityAnnouncement(
+      this.endReason === "SURVIVOR"
+        ? "POST_MATCH_SURVIVOR"
+        : "POST_MATCH_ALL_CLAIMED",
+      closingText,
+      now,
+    );
+  }
+
+  /** Helper for #20 Whispers: draws a non-repeating Whisper leak header. */
+  drawWhisperLeakBeat(playerName: string, targetName: string): string {
+    return this.copyEngine.drawBeat("WHISPER_LEAK", {
+      player: playerName,
+      target: targetName,
+    });
+  }
+
+  /** Helper for #21 Ghost Curses: draws a collapsed Curse pass/fail callout. */
+  drawCurseBeat(
+    playerName: string,
+    passedWords: readonly string[],
+    failedWords: readonly string[],
+  ): string {
+    return this.copyEngine.drawCurseBeat(playerName, passedWords, failedWords);
+  }
+
+  /** Helper for #24 Post-match: draws a closing Entity beat. */
+  drawPostMatchBeat(
+    endReason: "SURVIVOR" | "ALL_CLAIMED",
+    winnerName?: string,
+  ): string {
+    if (endReason === "SURVIVOR") {
+      return this.copyEngine.drawBeat("POST_MATCH_SURVIVOR", {
+        player: winnerName ?? "Survivor",
+      });
+    }
+    return this.copyEngine.drawBeat("POST_MATCH_ALL_CLAIMED");
   }
 
   private transferHostFrom(departingPlayerId: string): void {
@@ -1340,7 +1392,7 @@ export class RoomCore {
       entityMood: this.entityMood,
       previousRoundMood: this.previousRoundMood,
       nextMoodRotationAt: this.nextMoodRotationAt,
-      usedMoodHints: Array.from(this.usedMoodHints),
+      copyState: this.copyEngine.serialize(),
       roundId: this.roundId,
       isSuddenDeath: this.isSuddenDeath,
       roundPublicMessages: this.roundPublicMessages,

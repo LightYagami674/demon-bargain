@@ -26,39 +26,6 @@ export const MOOD_RUBRICS: Record<EntityMood, string> = {
     "Reward clever misdirection, dark wit, and unexpected twists; punish predictable groveling or repetitive pleas.",
 };
 
-export const MOOD_HINTS: Record<EntityMood, readonly string[]> = {
-  SADIST: [
-    "Show me something that hurts to watch.",
-    "Mercy bores me. Give me teeth and desperation.",
-    "I want to hear someone crack under the weight.",
-  ],
-  BLOODHOUND: [
-    "I smell blood. Point me toward the guilty throat.",
-    "Name your rival and make me believe it.",
-    "Vague prayers won't save you. Give me a target.",
-  ],
-  MARTYR_TRAP: [
-    "Bow low if you wish, but mind whose neck you step on.",
-    "Saints burn brightest when they offer themselves.",
-    "Pious words taste sweet—until you volunteer.",
-  ],
-  TYRANT: [
-    "Kneel. Do not bargain with what owns you.",
-    "Defiance is a short path to the altar.",
-    "Speak only as a trembling subject.",
-  ],
-  PARANOID: [
-    "Someone in this room is already plotting against you.",
-    "Trust is a rot. Expose the whispers.",
-    "Watch who stays quiet while others bleed.",
-  ],
-  TRICKSTER: [
-    "Surprise me. Predictable begging puts me to sleep.",
-    "A clever lie is worth ten honest tears.",
-    "Twist the knife with style, or be the punchline.",
-  ],
-};
-
 export function pickNextMood(
   excludeMood: EntityMood | null,
   random: () => number,
@@ -68,20 +35,6 @@ export function pickNextMood(
     : [...ENTITY_MOODS];
   const idx = Math.floor(random() * candidates.length);
   return candidates[idx] ?? candidates[0]!;
-}
-
-export function pickMoodHint(
-  mood: EntityMood,
-  usedHints: Set<string>,
-  random: () => number,
-): string {
-  const pool = MOOD_HINTS[mood];
-  const unused = pool.filter((h) => !usedHints.has(h));
-  const candidates = unused.length > 0 ? unused : pool;
-  const idx = Math.floor(random() * candidates.length);
-  const chosen = candidates[idx] ?? candidates[0]!;
-  usedHints.add(chosen);
-  return chosen;
 }
 
 export interface JudgeMessageInput {
