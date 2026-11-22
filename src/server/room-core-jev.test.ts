@@ -120,6 +120,10 @@ class FakeJevRoomHarness {
       scheduleAlarm: (at) => {
         this.alarmAt = at;
       },
+      deleteAll: () => {
+        this.storedState = null;
+        this.alarmAt = null;
+      },
     };
 
     this.room = new RoomCore({

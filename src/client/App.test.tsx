@@ -18,6 +18,7 @@ class FakeRoomSocket implements RoomSocket {
   readyState = 0; // CONNECTING
   sent: ClientMessage[] = [];
   closed = false;
+  reconnectCount = 0;
   readonly roomCode: string;
 
   private openListeners = new Set<() => void>();
@@ -37,6 +38,10 @@ class FakeRoomSocket implements RoomSocket {
     this.closed = true;
     this.readyState = 3;
     for (const fn of this.closeListeners) fn();
+  }
+
+  reconnect(): void {
+    this.reconnectCount += 1;
   }
 
   addEventListener(type: "open", listener: () => void): void;
@@ -928,5 +933,128 @@ describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live publ
       });
       expect(countBandpass()).toBe(3);
     });
+  });
+
+  it("shows reconnect banner on IN_MATCH disconnect, triggers reconnect on visibilitychange/online, and restores via token", () => {
+    const now = Date.now();
+    setRoomToken("WXYZ", "tok-alice");
+    window.history.replaceState({}, "", "/room/WXYZ");
+
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "WXYZ",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 50_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+
+    expect(screen.queryByTestId("reconnect-banner")).not.toBeInTheDocument();
+
+    // Simulate mobile connection drop
+    act(() => {
+      sock.close();
+    });
+    expect(screen.getByTestId("reconnect-banner")).toHaveTextContent(
+      /reconnecting/i,
+    );
+
+    // visibilitychange to visible triggers socket.reconnect()
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(sock.reconnectCount).toBe(1);
+
+    // online event also triggers socket.reconnect() while still disconnected
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(sock.reconnectCount).toBe(2);
+
+    // Socket reopens -> sends token join -> snapshot clears banner
+    sock.sent = [];
+    act(() => {
+      sock.emitOpen();
+    });
+    expect(sock.sent).toContainEqual({
+      type: "join",
+      playerToken: "tok-alice",
+    });
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "WXYZ",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now + 3000,
+        phaseEndsAt: now + 50_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+
+    expect(screen.queryByTestId("reconnect-banner")).not.toBeInTheDocument();
   });
 });

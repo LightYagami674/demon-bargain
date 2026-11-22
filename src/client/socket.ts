@@ -4,6 +4,7 @@ export interface RoomSocket {
   readonly readyState: number;
   send(data: string): void;
   close(code?: number, reason?: string): void;
+  reconnect?: (code?: number, reason?: string) => void;
   addEventListener(type: "open", listener: () => void): void;
   addEventListener(
     type: "message",
