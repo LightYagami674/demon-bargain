@@ -6,15 +6,29 @@ import {
   MAX_PLAYERS,
   MIN_CHAT_LENGTH,
   MIN_PLAYERS,
+  MOOD_ROTATION_MS,
   PRESET_AVATARS,
+  RECENT_CONTEXT_LIMIT,
   ROUND_INTRO_MS,
+  ROUND_RESOLVING_MAX_MS,
   ROUND_RESOLVING_MS,
   SACRIFICE_REVEAL_MS,
+  SPAM_MOCKERY_COOLDOWN_MS,
+  SUDDEN_DEATH_CLAMP_DOOM,
+  SUDDEN_DEATH_DURATION_MS,
   WAITING_DISCONNECT_GRACE_MS,
   getRoundDurationMs,
   softResetDoom,
   type PresetAvatarId,
 } from "../shared/constants.js";
+import {
+  MOOD_RUBRICS,
+  pickMoodHint,
+  pickNextMood,
+  type EntityMood,
+  type JevEvaluator,
+  type JudgeMessageResult,
+} from "./jev.js";
 import {
   ClientMessageSchema,
   type ClientMessage,
@@ -46,6 +60,8 @@ export interface RoomCoreOptions {
   storage: RoomStorage;
   clock?: () => number;
   generateId?: () => string;
+  random?: () => number;
+  jevEvaluator?: JevEvaluator;
 }
 
 interface InternalPlayer {
@@ -74,6 +90,15 @@ interface PersistedRoomState {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   players: InternalPlayer[];
+  entityMood?: EntityMood;
+  previousRoundMood?: EntityMood | null;
+  nextMoodRotationAt?: number | null;
+  usedMoodHints?: string[];
+  roundId?: string;
+  isSuddenDeath?: boolean;
+  roundPublicMessages?: Array<{ speakerName: string; text: string }>;
+  lastSpamMockeryAt?: number | null;
+  resolvingCapAt?: number | null;
 }
 
 export class RoomCore {
@@ -82,6 +107,8 @@ export class RoomCore {
   private readonly storage: RoomStorage;
   private readonly clock: () => number;
   private readonly generateId: () => string;
+  private readonly random: () => number;
+  private readonly jevEvaluator?: JevEvaluator;
 
   private phase: RoomPhase = "WAITING";
   private matchPhase: MatchPhase | null = null;
@@ -94,6 +121,16 @@ export class RoomCore {
   private endReason: MatchEndReason | null = null;
   private feed: FeedItem[] = [];
   private players: InternalPlayer[] = [];
+  private entityMood: EntityMood = "SADIST";
+  private previousRoundMood: EntityMood | null = null;
+  private nextMoodRotationAt: number | null = null;
+  private usedMoodHints = new Set<string>();
+  private roundId = "";
+  private isSuddenDeath = false;
+  private roundPublicMessages: Array<{ speakerName: string; text: string }> = [];
+  private lastSpamMockeryAt: number | null = null;
+  private resolvingCapAt: number | null = null;
+  private pendingEvaluations = new Set<Promise<void>>();
   private connectionToPlayerId = new Map<string, string>();
   private playerIdToConnectionId = new Map<string, string>();
 
@@ -103,6 +140,8 @@ export class RoomCore {
     this.storage = options.storage;
     this.clock = options.clock ?? (() => Date.now());
     this.generateId = options.generateId ?? (() => crypto.randomUUID());
+    this.random = options.random ?? (() => Math.random());
+    this.jevEvaluator = options.jevEvaluator;
 
     const raw = this.storage.load();
     if (raw) {
@@ -122,9 +161,25 @@ export class RoomCore {
           ...p,
           lastChatAt: p.lastChatAt ?? null,
         }));
+        this.entityMood = parsed.entityMood ?? "SADIST";
+        this.previousRoundMood = parsed.previousRoundMood ?? null;
+        this.nextMoodRotationAt = parsed.nextMoodRotationAt ?? null;
+        this.usedMoodHints = new Set(parsed.usedMoodHints ?? []);
+        this.roundId = parsed.roundId ?? "";
+        this.isSuddenDeath = parsed.isSuddenDeath ?? false;
+        this.roundPublicMessages = parsed.roundPublicMessages ?? [];
+        this.lastSpamMockeryAt = parsed.lastSpamMockeryAt ?? null;
+        this.resolvingCapAt = parsed.resolvingCapAt ?? null;
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
+    }
+  }
+
+  /** Await all currently in-flight Jev evaluations (useful for deterministic tests). */
+  async flushPendingEvaluations(): Promise<void> {
+    while (this.pendingEvaluations.size > 0) {
+      await Promise.all(Array.from(this.pendingEvaluations));
     }
   }
 
@@ -249,6 +304,21 @@ export class RoomCore {
       now >= this.phaseEndsAt
     ) {
       this.advanceMatchPhase(now);
+    } else if (
+      this.phase === "IN_MATCH" &&
+      this.matchPhase === "ROUND_ACTIVE" &&
+      !this.isSuddenDeath &&
+      this.nextMoodRotationAt !== null &&
+      now >= this.nextMoodRotationAt
+    ) {
+      this.entityMood = pickNextMood(this.entityMood, this.random);
+      const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+      this.nextMoodRotationAt =
+        this.phaseEndsAt !== null && now + MOOD_ROTATION_MS < this.phaseEndsAt
+          ? now + MOOD_ROTATION_MS
+          : null;
+      this.persist();
+      this.emitEntityAnnouncement("MOOD_SHIFT", hint, now);
     }
 
     this.rescheduleAlarm();
@@ -257,9 +327,16 @@ export class RoomCore {
   private advanceMatchPhase(now: number): void {
     if (this.matchPhase === "ROUND_INTRO") {
       const livingCount = this.players.filter((p) => p.alive).length;
+      const durationMs = getRoundDurationMs(
+        livingCount,
+        this.initialPlayerCount,
+      );
       this.matchPhase = "ROUND_ACTIVE";
-      this.phaseEndsAt =
-        now + getRoundDurationMs(livingCount, this.initialPlayerCount);
+      this.phaseEndsAt = now + durationMs;
+      this.nextMoodRotationAt =
+        !this.isSuddenDeath && MOOD_ROTATION_MS < durationMs
+          ? now + MOOD_ROTATION_MS
+          : null;
       this.persist();
       this.broadcastPhaseChanged(now);
       return;
@@ -267,7 +344,13 @@ export class RoomCore {
 
     if (this.matchPhase === "ROUND_ACTIVE") {
       this.matchPhase = "ROUND_RESOLVING";
-      this.phaseEndsAt = now + ROUND_RESOLVING_MS;
+      this.nextMoodRotationAt = null;
+      const resolvingMs =
+        this.pendingEvaluations.size > 0
+          ? ROUND_RESOLVING_MAX_MS
+          : ROUND_RESOLVING_MS;
+      this.phaseEndsAt = now + resolvingMs;
+      this.resolvingCapAt = now + ROUND_RESOLVING_MAX_MS;
       this.persist();
       this.broadcastPhaseChanged(now);
       return;
@@ -275,26 +358,23 @@ export class RoomCore {
 
     if (this.matchPhase === "ROUND_RESOLVING") {
       const living = this.players.filter((p) => p.alive);
-      let victim: InternalPlayer | null = null;
-      for (const candidate of living) {
-        if (!victim || candidate.doom > victim.doom) {
-          victim = candidate;
-        }
+      if (living.length === 0) {
+        this.matchPhase = "SACRIFICE_REVEAL";
+        this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
+        this.persist();
+        this.broadcastPhaseChanged(now);
+        return;
       }
-      if (victim) {
-        victim.alive = false;
-        this.sacrificedPlayerId = victim.id;
-      }
-      this.matchPhase = "SACRIFICE_REVEAL";
-      this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
-      this.persist();
-      this.broadcastPhaseChanged(now);
-      if (victim) {
-        this.emitEntityAnnouncement(
-          "SACRIFICE_REVEAL",
-          `${victim.name} has been claimed by the Entity.`,
-          now,
-        );
+
+      const maxDoom = Math.max(...living.map((p) => p.doom));
+      const tied = living.filter((p) => p.doom === maxDoom);
+      if (tied.length === 1) {
+        this.sacrificePlayer(tied[0]!, now);
+      } else if (!this.isSuddenDeath) {
+        this.triggerSuddenDeath(now);
+      } else {
+        const victim = this.breakTieLongestSilentThenRandom(tied);
+        this.sacrificePlayer(victim, now);
       }
       return;
     }
@@ -315,6 +395,14 @@ export class RoomCore {
 
       this.round += 1;
       this.sacrificedPlayerId = null;
+      this.isSuddenDeath = false;
+      this.roundId = this.generateId();
+      this.roundPublicMessages = [];
+      this.nextMoodRotationAt = null;
+      this.resolvingCapAt = null;
+      this.entityMood = pickNextMood(this.previousRoundMood, this.random);
+      this.previousRoundMood = this.entityMood;
+      const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
       for (const p of living) {
         p.doom = softResetDoom(p.doom);
       }
@@ -324,7 +412,7 @@ export class RoomCore {
       this.broadcastPhaseChanged(now);
       this.emitEntityAnnouncement(
         "ROUND_INTRO",
-        `Round ${this.round} begins. The Entity turns its gaze upon you.`,
+        `Round ${this.round} begins. ${hint}`,
         now,
       );
     }
@@ -540,6 +628,16 @@ export class RoomCore {
     this.winnerId = null;
     this.endReason = null;
     this.feed = [];
+    this.usedMoodHints.clear();
+    this.isSuddenDeath = false;
+    this.roundId = this.generateId();
+    this.roundPublicMessages = [];
+    this.lastSpamMockeryAt = null;
+    this.nextMoodRotationAt = null;
+    this.resolvingCapAt = null;
+    this.entityMood = pickNextMood(null, this.random);
+    this.previousRoundMood = this.entityMood;
+    const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
     this.phaseEndsAt = now + ROUND_INTRO_MS;
 
     for (const p of this.players) {
@@ -553,7 +651,7 @@ export class RoomCore {
     this.broadcastPhaseChanged(now);
     this.emitEntityAnnouncement(
       "ROUND_INTRO",
-      `Round 1 begins. The Entity turns its gaze upon you.`,
+      `Round 1 begins. ${hint}`,
       now,
     );
   }
@@ -604,6 +702,15 @@ export class RoomCore {
 
     player.lastChatAt = now;
     const id = this.generateId();
+    const recentBefore = this.roundPublicMessages.slice(-RECENT_CONTEXT_LIMIT);
+    this.roundPublicMessages.push({ speakerName: player.name, text });
+    if (this.roundPublicMessages.length > RECENT_CONTEXT_LIMIT) {
+      this.roundPublicMessages.splice(
+        0,
+        this.roundPublicMessages.length - RECENT_CONTEXT_LIMIT,
+      );
+    }
+
     this.pushFeedItem({
       kind: "chat",
       id,
@@ -625,6 +732,233 @@ export class RoomCore {
       timestamp: now,
     };
     this.transport.broadcast(JSON.stringify(payload));
+
+    if (this.jevEvaluator) {
+      const roundId = this.roundId;
+      const livingPlayers = this.players
+        .filter((p) => p.alive)
+        .map((p) => ({ id: p.id, name: p.name, doom: p.doom }));
+      const evalPromise = this.jevEvaluator
+        .judgeMessage({
+          roundId,
+          entityMood: this.entityMood,
+          moodRubric: MOOD_RUBRICS[this.entityMood],
+          livingPlayers,
+          recentMessages: recentBefore,
+          speaker: { id: player.id, name: player.name },
+          messageText: text,
+        })
+        .then((verdict) => {
+          this.applyJudgeVerdict(player.id, id, verdict);
+        })
+        .catch(() => {
+          this.handleJudgeFailure(roundId);
+        })
+        .finally(() => {
+          this.pendingEvaluations.delete(evalPromise);
+        });
+      this.pendingEvaluations.add(evalPromise);
+    }
+  }
+
+  private applyJudgeVerdict(
+    speakerId: string,
+    sourceMessageId: string,
+    verdict: JudgeMessageResult,
+  ): void {
+    if (this.phase !== "IN_MATCH") return;
+    if (verdict.roundId !== this.roundId) return;
+    if (
+      this.matchPhase !== "ROUND_ACTIVE" &&
+      this.matchPhase !== "ROUND_RESOLVING"
+    ) {
+      return;
+    }
+    const now = this.clock();
+    if (
+      this.matchPhase === "ROUND_RESOLVING" &&
+      this.resolvingCapAt !== null &&
+      now > this.resolvingCapAt
+    ) {
+      return;
+    }
+
+    const speaker = this.players.find((p) => p.id === speakerId && p.alive);
+    if (!speaker) return;
+
+    const deltas = new Map<string, number>();
+    let emitSpamMockery = false;
+
+    if (verdict.isLowEffortSpamNoul >= 0.7) {
+      deltas.set(speaker.id, 8);
+      if (
+        this.lastSpamMockeryAt === null ||
+        now - this.lastSpamMockeryAt >= SPAM_MOCKERY_COOLDOWN_MS
+      ) {
+        this.lastSpamMockeryAt = now;
+        emitSpamMockery = true;
+      }
+    } else {
+      let speakerDelta = Math.round((2.0 - verdict.persuasivenessScore) * 6);
+      if (
+        verdict.targetBlamed === "SELF" &&
+        verdict.targetBlamedConfidence >= 0.6
+      ) {
+        speakerDelta += 8;
+      }
+      deltas.set(speaker.id, speakerDelta);
+
+      if (
+        verdict.targetBlamed !== "SELF" &&
+        verdict.targetBlamed !== "NONE" &&
+        verdict.targetBlamedConfidence >= 0.6 &&
+        verdict.persuasivenessScore > 2.0
+      ) {
+        const target = this.players.find(
+          (p) => p.id === verdict.targetBlamed && p.alive && p.id !== speaker.id,
+        );
+        if (target) {
+          const blameDelta = Math.round(
+            (verdict.persuasivenessScore - 2.0) * 5,
+          );
+          if (blameDelta > 0) {
+            deltas.set(target.id, (deltas.get(target.id) ?? 0) + blameDelta);
+          }
+        }
+      }
+    }
+
+    const updates: Array<{ playerId: string; doom: number; delta: number }> = [];
+    for (const [playerId, rawDelta] of deltas) {
+      const target = this.players.find((p) => p.id === playerId && p.alive);
+      if (!target) continue;
+      const oldDoom = target.doom;
+      const newDoom = Math.max(0, Math.min(100, oldDoom + rawDelta));
+      target.doom = newDoom;
+      updates.push({
+        playerId,
+        doom: newDoom,
+        delta: newDoom - oldDoom,
+      });
+    }
+
+    this.persist();
+
+    if (updates.length > 0) {
+      const payload: ServerMessage = {
+        type: "doom_updated",
+        updates,
+        sourceMessageId,
+      };
+      this.transport.broadcast(JSON.stringify(payload));
+    }
+
+    if (emitSpamMockery) {
+      this.emitEntityAnnouncement(
+        "SPAM_MOCKERY",
+        `${speaker.name}, your empty babble only feeds the altar.`,
+        now,
+      );
+    }
+
+    const maxed = this.players.filter((p) => p.alive && p.doom >= 100);
+    if (maxed.length === 1) {
+      this.sacrificePlayer(maxed[0]!, now);
+      this.rescheduleAlarm();
+    } else if (maxed.length > 1) {
+      if (!this.isSuddenDeath) {
+        this.triggerSuddenDeath(now);
+      } else {
+        const victim = this.breakTieLongestSilentThenRandom(maxed);
+        this.sacrificePlayer(victim, now);
+      }
+      this.rescheduleAlarm();
+    }
+  }
+
+  private sacrificePlayer(victim: InternalPlayer, now: number): void {
+    victim.alive = false;
+    this.sacrificedPlayerId = victim.id;
+    this.isSuddenDeath = false;
+    this.nextMoodRotationAt = null;
+    this.resolvingCapAt = null;
+    this.roundId = this.generateId();
+    this.matchPhase = "SACRIFICE_REVEAL";
+    this.phaseEndsAt = now + SACRIFICE_REVEAL_MS;
+    this.persist();
+    this.broadcastPhaseChanged(now);
+    this.emitEntityAnnouncement(
+      "SACRIFICE_REVEAL",
+      `${victim.name} has been claimed by the Entity.`,
+      now,
+    );
+  }
+
+  private triggerSuddenDeath(now: number): void {
+    for (const p of this.players) {
+      if (p.alive && p.doom >= 100) {
+        p.doom = SUDDEN_DEATH_CLAMP_DOOM;
+      }
+    }
+    this.isSuddenDeath = true;
+    this.sacrificedPlayerId = null;
+    this.roundId = this.generateId();
+    this.roundPublicMessages = [];
+    this.nextMoodRotationAt = null;
+    this.resolvingCapAt = null;
+    this.entityMood = pickNextMood(this.entityMood, this.random);
+    this.previousRoundMood = this.entityMood;
+    const hint = pickMoodHint(this.entityMood, this.usedMoodHints, this.random);
+
+    this.matchPhase = "ROUND_ACTIVE";
+    this.phaseEndsAt = now + SUDDEN_DEATH_DURATION_MS;
+    this.persist();
+    this.broadcastPhaseChanged(now);
+    this.emitEntityAnnouncement(
+      "SUDDEN_DEATH",
+      `A tie for the altar! 30 seconds of sudden death. ${hint}`,
+      now,
+    );
+  }
+
+  private breakTieLongestSilentThenRandom(
+    tied: InternalPlayer[],
+  ): InternalPlayer {
+    let earliestChat = Infinity;
+    for (const p of tied) {
+      const score = p.lastChatAt ?? -Infinity;
+      if (score < earliestChat) {
+        earliestChat = score;
+      }
+    }
+    const longestSilent = tied.filter(
+      (p) => (p.lastChatAt ?? -Infinity) === earliestChat,
+    );
+    const idx = Math.floor(this.random() * longestSilent.length);
+    return longestSilent[idx] ?? longestSilent[0]!;
+  }
+
+  private handleJudgeFailure(roundId: string): void {
+    if (this.phase !== "IN_MATCH" || roundId !== this.roundId) return;
+    const now = this.clock();
+    this.phase = "POST_MATCH";
+    this.matchPhase = null;
+    this.phaseEndsAt = null;
+    this.nextMoodRotationAt = null;
+    this.resolvingCapAt = null;
+    this.isSuddenDeath = false;
+    this.sacrificedPlayerId = null;
+    this.winnerId = null;
+    this.endReason = "JUDGE_ERROR";
+    this.roundId = this.generateId();
+    this.persist();
+    this.rescheduleAlarm();
+    this.broadcastPhaseChanged(now);
+    this.emitEntityAnnouncement(
+      "POST_MATCH_JUDGE_ERROR",
+      "The Entity fell silent — Match aborted",
+      now,
+    );
   }
 
   private handleLeaveRoom(connectionId: string): void {
@@ -818,8 +1152,19 @@ export class RoomCore {
 
   private rescheduleAlarm(): void {
     let earliest: number | null = null;
-    if (this.phase === "IN_MATCH" && this.phaseEndsAt !== null) {
-      earliest = this.phaseEndsAt;
+    if (this.phase === "IN_MATCH") {
+      if (this.phaseEndsAt !== null) {
+        earliest = this.phaseEndsAt;
+      }
+      if (
+        this.matchPhase === "ROUND_ACTIVE" &&
+        !this.isSuddenDeath &&
+        this.nextMoodRotationAt !== null
+      ) {
+        if (earliest === null || this.nextMoodRotationAt < earliest) {
+          earliest = this.nextMoodRotationAt;
+        }
+      }
     }
     for (const p of this.players) {
       if (!p.connected && p.disconnectGraceEndsAt !== null) {
@@ -844,6 +1189,15 @@ export class RoomCore {
       endReason: this.endReason,
       feed: this.feed,
       players: this.players,
+      entityMood: this.entityMood,
+      previousRoundMood: this.previousRoundMood,
+      nextMoodRotationAt: this.nextMoodRotationAt,
+      usedMoodHints: Array.from(this.usedMoodHints),
+      roundId: this.roundId,
+      isSuddenDeath: this.isSuddenDeath,
+      roundPublicMessages: this.roundPublicMessages,
+      lastSpamMockeryAt: this.lastSpamMockeryAt,
+      resolvingCapAt: this.resolvingCapAt,
     };
     this.storage.save(JSON.stringify(state));
   }

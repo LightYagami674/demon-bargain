@@ -1,4 +1,5 @@
 import { Server, type Connection, type WSMessage } from "partyserver";
+import { TypeSafeJevEvaluator } from "./jev.js";
 import { RoomCore, type RoomStorage, type RoomTransport } from "./room-core.js";
 
 export interface Env {
@@ -70,6 +71,9 @@ export class Room extends Server<Env> {
       roomCode: this.name.toUpperCase(),
       transport,
       storage,
+      ...(this.env.TYPESAFE_API_KEY
+        ? { jevEvaluator: new TypeSafeJevEvaluator(this.env.TYPESAFE_API_KEY) }
+        : {}),
     });
 
     for (const conn of this.getConnections<ConnectionAttachment>()) {
