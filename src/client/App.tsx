@@ -67,6 +67,7 @@ interface RoomSnapshotState {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   chatCooldownEndsAt: number | null;
+  whisperCooldownEndsAt: number | null;
 }
 
 export function App({ createSocket = createPartyRoomSocket }: AppProps) {
@@ -376,6 +377,7 @@ function RoomView({
             endReason: msg.endReason ?? null,
             feed: msg.feed ?? [],
             chatCooldownEndsAt: msg.chatCooldownEndsAt ?? null,
+            whisperCooldownEndsAt: msg.whisperCooldownEndsAt ?? null,
           });
           break;
         }
@@ -420,6 +422,45 @@ function RoomView({
               playerName: msg.playerName,
               avatarId: msg.avatarId,
               text: msg.text,
+              timestamp: msg.timestamp,
+            };
+            const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
+            return { ...prev, feed: nextFeed };
+          });
+          break;
+        }
+        case "whisper_message": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const item: FeedItem = {
+              kind: "whisper",
+              id: msg.id,
+              senderId: msg.senderId,
+              senderName: msg.senderName,
+              senderAvatarId: msg.senderAvatarId,
+              targetId: msg.targetId,
+              targetName: msg.targetName,
+              text: msg.text,
+              timestamp: msg.timestamp,
+            };
+            const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
+            return { ...prev, feed: nextFeed };
+          });
+          break;
+        }
+        case "whisper_intercepted": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const item: FeedItem = {
+              kind: "whisper_intercepted",
+              id: msg.id,
+              whisperId: msg.whisperId,
+              senderId: msg.senderId,
+              senderName: msg.senderName,
+              targetId: msg.targetId,
+              targetName: msg.targetName,
+              headerText: msg.headerText,
+              whisperText: msg.whisperText,
               timestamp: msg.timestamp,
             };
             const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
@@ -639,10 +680,14 @@ function RoomView({
         endReason={snapshot.endReason}
         feed={snapshot.feed}
         serverCooldownEndsAt={snapshot.chatCooldownEndsAt}
+        serverWhisperCooldownEndsAt={snapshot.whisperCooldownEndsAt}
         reconnecting={!socketOpen}
         errorBanner={errorBanner}
         onDismissError={() => setErrorBanner(null)}
         onSendChat={(text) => sendMessage({ type: "send_chat", text })}
+        onSendWhisper={(targetPlayerId, text) =>
+          sendMessage({ type: "send_whisper", targetPlayerId, text })
+        }
         onLeave={handleLeave}
       />
     );

@@ -2,8 +2,12 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   CHAT_COOLDOWN_MS,
   MAX_CHAT_LENGTH,
+  MAX_WHISPER_LENGTH,
   MIN_CHAT_LENGTH,
+  MIN_PLAYERS_FOR_WHISPERS,
+  MIN_WHISPER_LENGTH,
   PRESET_AVATARS,
+  WHISPER_COOLDOWN_MS,
   doomColor,
 } from "../shared/constants.js";
 import type {
@@ -36,10 +40,12 @@ export interface MatchHudProps {
   endReason: MatchEndReason | null;
   feed: FeedItem[];
   serverCooldownEndsAt: number | null;
+  serverWhisperCooldownEndsAt?: number | null;
   reconnecting?: boolean;
   errorBanner: { code?: ErrorCode; message: string } | null;
   onDismissError: () => void;
   onSendChat: (text: string) => void;
+  onSendWhisper?: (targetPlayerId: string, text: string) => void;
   onLeave: () => void;
 }
 
@@ -78,15 +84,20 @@ export function MatchHud({
   endReason,
   feed,
   serverCooldownEndsAt,
+  serverWhisperCooldownEndsAt = null,
   reconnecting = false,
   errorBanner,
   onDismissError,
   onSendChat,
+  onSendWhisper,
   onLeave,
 }: MatchHudProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [draft, setDraft] = useState("");
+  const [whisperTargetId, setWhisperTargetId] = useState<string | null>(null);
   const [localCooldownEndsAt, setLocalCooldownEndsAt] = useState<number>(0);
+  const [localWhisperCooldownEndsAt, setLocalWhisperCooldownEndsAt] =
+    useState<number>(0);
   const [validationNote, setValidationNote] = useState<string | null>(null);
   const [impactNow, setImpactNow] = useState(false);
   const [staticFlashActive, setStaticFlashActive] = useState(false);
@@ -186,8 +197,9 @@ export function MatchHud({
     const newItems = feed.slice(prevLen);
     const hasShockBeat = newItems.some(
       (item) =>
-        item.kind === "entity" &&
-        /whisper|leak|intercept|curse/i.test(item.beatType),
+        (item.kind === "entity" &&
+          /whisper|leak|intercept|curse/i.test(item.beatType)) ||
+        item.kind === "whisper_intercepted",
     );
     if (hasShockBeat) {
       triggerImpact();
@@ -250,12 +262,35 @@ export function MatchHud({
 
   const canSpeak =
     phase === "IN_MATCH" && matchPhase === "ROUND_ACTIVE" && isAlive;
+  const livingCount = players.filter((p) => p.alive).length;
+  const whispersEnabled = canSpeak && livingCount >= MIN_PLAYERS_FOR_WHISPERS;
+  const whisperTarget =
+    whispersEnabled && whisperTargetId
+      ? players.find(
+          (p) => p.id === whisperTargetId && p.id !== selfPlayerId && p.alive,
+        ) ?? null
+      : null;
 
-  const effectiveCooldownEndsAt = Math.max(
+  useEffect(() => {
+    if (whisperTargetId && !whisperTarget) {
+      setWhisperTargetId(null);
+    }
+  }, [whisperTargetId, whisperTarget]);
+
+  const effectiveChatCooldownEndsAt = Math.max(
     localCooldownEndsAt,
     serverCooldownEndsAt !== null ? serverCooldownEndsAt - clockOffsetMs : 0,
   );
-  const cooldownRemainingMs = Math.max(0, effectiveCooldownEndsAt - nowMs);
+  const effectiveWhisperCooldownEndsAt = Math.max(
+    localWhisperCooldownEndsAt,
+    serverWhisperCooldownEndsAt !== null
+      ? serverWhisperCooldownEndsAt - clockOffsetMs
+      : 0,
+  );
+  const activeCooldownEndsAt = whisperTarget
+    ? effectiveWhisperCooldownEndsAt
+    : effectiveChatCooldownEndsAt;
+  const cooldownRemainingMs = Math.max(0, activeCooldownEndsAt - nowMs);
   const inCooldown = cooldownRemainingMs > 0;
 
   const countdown = formatCountdown(phaseEndsAt, clockOffsetMs, nowMs);
@@ -270,6 +305,31 @@ export function MatchHud({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSpeak) return;
+    if (whisperTarget) {
+      if (inCooldown) {
+        setValidationNote(
+          `Wait ${Math.ceil(cooldownRemainingMs / 1000)}s before whispering again.`,
+        );
+        return;
+      }
+      const trimmed = draft.trim();
+      if (
+        trimmed.length < MIN_WHISPER_LENGTH ||
+        trimmed.length > MAX_WHISPER_LENGTH
+      ) {
+        setValidationNote(
+          `Whisper must be ${MIN_WHISPER_LENGTH}–${MAX_WHISPER_LENGTH} characters.`,
+        );
+        return;
+      }
+      setValidationNote(null);
+      setLocalWhisperCooldownEndsAt(Date.now() + WHISPER_COOLDOWN_MS);
+      setDraft("");
+      setWhisperTargetId(null);
+      onSendWhisper?.(whisperTarget.id, trimmed);
+      return;
+    }
+
     if (inCooldown) {
       setValidationNote(
         `Wait ${Math.ceil(cooldownRemainingMs / 1000)}s before pleading again.`,
@@ -296,6 +356,8 @@ export function MatchHud({
     placeholder = "You are a Ghost — public pleading is sealed";
   } else if (matchPhase !== "ROUND_ACTIVE") {
     placeholder = "Chat unlocks when the round begins...";
+  } else if (whisperTarget) {
+    placeholder = `Whisper secretly to ${whisperTarget.name}...`;
   }
 
   const fxStyle = {
@@ -406,14 +468,11 @@ export function MatchHud({
             const isSelf = p.id === selfPlayerId;
             const ringColor = p.alive ? doomColor(p.doom) : "#52525b";
             const dashOffset = RING_CIRC * (1 - p.doom / 100);
+            const canWhisperTarget = whispersEnabled && !isSelf && p.alive;
+            const isSelected = whisperTarget?.id === p.id;
 
-            return (
-              <div
-                key={p.id}
-                className={`vb-node w-[52px] py-1 px-0.5 rounded-[10px] border border-transparent flex flex-col items-center gap-0.5 ${
-                  !p.alive ? "ghost opacity-45" : ""
-                } ${isSelf ? "bg-zinc-900/70" : ""}`}
-              >
+            const nodeContent = (
+              <>
                 <div className="vb-ring-wrap relative w-[38px] h-[38px] flex items-center justify-center">
                   <svg
                     width="38"
@@ -455,6 +514,44 @@ export function MatchHud({
                 <span className="vb-name text-[9.5px] text-zinc-300 truncate max-w-[50px]">
                   {p.name}
                 </span>
+              </>
+            );
+
+            const baseClass = `vb-node w-[52px] py-1 px-0.5 rounded-[10px] border flex flex-col items-center gap-0.5 transition-colors ${
+              !p.alive ? "ghost opacity-45" : ""
+            } ${
+              isSelected
+                ? "selected border-[#a855f7] bg-[#a855f7]/15"
+                : isSelf
+                  ? "border-transparent bg-zinc-900/70"
+                  : "border-transparent"
+            }`;
+
+            if (canWhisperTarget) {
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  data-testid={`rail-player-${p.id}`}
+                  aria-pressed={isSelected}
+                  aria-label={`Whisper to ${p.name}`}
+                  onClick={() =>
+                    setWhisperTargetId((prev) => (prev === p.id ? null : p.id))
+                  }
+                  className={`${baseClass} cursor-pointer hover:border-purple-500/50`}
+                >
+                  {nodeContent}
+                </button>
+              );
+            }
+
+            return (
+              <div
+                key={p.id}
+                data-testid={`rail-player-${p.id}`}
+                className={baseClass}
+              >
+                {nodeContent}
               </div>
             );
           })}
@@ -524,6 +621,44 @@ export function MatchHud({
                   );
                 }
 
+                if (item.kind === "whisper") {
+                  const isMine = item.senderId === selfPlayerId;
+                  return (
+                    <div
+                      key={item.id}
+                      className={`msg whisper max-w-[88%] rounded-xl border border-dashed border-purple-500/65 bg-[#221030]/95 px-3 py-2 text-[13.5px] leading-snug text-purple-100 ${
+                        isMine ? "mine self-end" : "self-start"
+                      }`}
+                    >
+                      <p className="text-[11px] font-bold text-purple-300 mb-0.5">
+                        {isMine
+                          ? `Whisper to ${item.targetName}`
+                          : `Whisper from ${item.senderName}`}
+                      </p>
+                      <p className="break-words">{item.text}</p>
+                    </div>
+                  );
+                }
+
+                if (item.kind === "whisper_intercepted") {
+                  return (
+                    <div
+                      key={item.id}
+                      className="msg intercepted self-stretch rounded-xl border border-rose-500 bg-[#3a0c1e]/95 px-3 py-2.5 text-[13.5px] leading-snug text-rose-100 space-y-1.5"
+                    >
+                      <p className="font-semibold italic text-rose-200">
+                        {item.headerText}
+                      </p>
+                      <blockquote
+                        data-testid="intercepted-whisper-quote"
+                        className="border-l-2 border-purple-400/80 bg-black/35 rounded-r-lg px-2.5 py-1.5 text-purple-100 not-italic break-words"
+                      >
+                        {item.whisperText}
+                      </blockquote>
+                    </div>
+                  );
+                }
+
                 const isMine = item.playerId === selfPlayerId;
                 return (
                   <div
@@ -547,8 +682,29 @@ export function MatchHud({
 
           <form
             onSubmit={handleSubmit}
-            className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1"
+            className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1.5"
           >
+            {whisperTarget && (
+              <div
+                data-testid="whisper-target-pill"
+                className="whisper-pill-bar flex items-center justify-between gap-2 rounded-lg border border-purple-500/60 bg-purple-950/60 px-2.5 py-1 text-xs text-purple-200"
+              >
+                <span>
+                  Whispering secretly to{" "}
+                  <strong className="font-bold text-purple-100">
+                    {whisperTarget.name}
+                  </strong>
+                </span>
+                <button
+                  type="button"
+                  aria-label="Cancel whisper"
+                  onClick={() => setWhisperTargetId(null)}
+                  className="rounded px-1.5 py-0.5 text-purple-300 hover:bg-purple-900/60 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             {validationNote && (
               <p className="text-[11px] text-amber-300 px-1">{validationNote}</p>
             )}
@@ -556,19 +712,27 @@ export function MatchHud({
               <input
                 type="text"
                 disabled={!canSpeak}
-                maxLength={MAX_CHAT_LENGTH}
+                maxLength={whisperTarget ? MAX_WHISPER_LENGTH : MAX_CHAT_LENGTH}
                 value={draft}
                 onChange={(e) => {
                   setDraft(e.target.value);
                   if (validationNote) setValidationNote(null);
                 }}
                 placeholder={placeholder}
-                className="composer-input flex-1 min-w-0 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-100 placeholder:text-zinc-500 disabled:opacity-50 focus:border-rose-500 focus:outline-none"
+                className={`composer-input flex-1 min-w-0 rounded-xl border px-3 py-2 text-base text-zinc-100 placeholder:text-zinc-500 disabled:opacity-50 focus:outline-none ${
+                  whisperTarget
+                    ? "whisper-mode border-[#a855f7] bg-[#1d1429] focus:border-purple-400"
+                    : "border-zinc-700 bg-zinc-900 focus:border-rose-500"
+                }`}
               />
               <button
                 type="submit"
                 disabled={!canSpeak}
-                className="rounded-xl bg-rose-700 hover:bg-rose-600 disabled:bg-zinc-800 disabled:text-zinc-500 px-3.5 py-2 text-sm font-bold text-white transition-colors shrink-0"
+                className={`rounded-xl disabled:bg-zinc-800 disabled:text-zinc-500 px-3.5 py-2 text-sm font-bold text-white transition-colors shrink-0 ${
+                  whisperTarget
+                    ? "bg-purple-700 hover:bg-purple-600"
+                    : "bg-rose-700 hover:bg-rose-600"
+                }`}
               >
                 {inCooldown
                   ? `${Math.ceil(cooldownRemainingMs / 1000)}s`
