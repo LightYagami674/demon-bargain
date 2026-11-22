@@ -12,7 +12,13 @@ export const WAITING_DISCONNECT_GRACE_MS = 30_000;
 export const INITIAL_DOOM = 50;
 export const ROUND_INTRO_MS = 3_500;
 export const ROUND_RESOLVING_MS = 2_000;
+export const ROUND_RESOLVING_MAX_MS = 3_000;
 export const SACRIFICE_REVEAL_MS = 4_500;
+export const MOOD_ROTATION_MS = 30_000;
+export const SUDDEN_DEATH_DURATION_MS = 30_000;
+export const SUDDEN_DEATH_CLAMP_DOOM = 95;
+export const SPAM_MOCKERY_COOLDOWN_MS = 5_000;
+export const RECENT_CONTEXT_LIMIT = 6;
 
 export const CHAT_COOLDOWN_MS = 2_500;
 export const MIN_CHAT_LENGTH = 2;

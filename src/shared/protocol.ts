@@ -171,6 +171,17 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     timestamp: z.number(),
   }),
   z.object({
+    type: z.literal("doom_updated"),
+    updates: z.array(
+      z.object({
+        playerId: z.string(),
+        doom: z.number().int().min(0).max(100),
+        delta: z.number().int(),
+      }),
+    ),
+    sourceMessageId: z.string().optional(),
+  }),
+  z.object({
     type: z.literal("kicked"),
     reason: z.string(),
   }),

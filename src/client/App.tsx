@@ -442,6 +442,18 @@ function RoomView({
           });
           break;
         }
+        case "doom_updated": {
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            const byId = new Map(msg.updates.map((u) => [u.playerId, u]));
+            const nextPlayers = prev.players.map((p) => {
+              const upd = byId.get(p.id);
+              return upd ? { ...p, doom: upd.doom } : p;
+            });
+            return { ...prev, players: nextPlayers };
+          });
+          break;
+        }
         case "kicked": {
           clearRoomToken(roomCode);
           socket.close();
