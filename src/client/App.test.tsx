@@ -1057,4 +1057,178 @@ describe("SPA Socket Seam — Variant B Mobile HUD, clock-skew timer & live publ
 
     expect(screen.queryByTestId("reconnect-banner")).not.toBeInTheDocument();
   });
+
+  it("supports Variant B left-rail Whisper targeting, violet composer, auto-reset to All, independent cooldown, and intercepted quote block", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/room/ABCD");
+    render(<App createSocket={createSocket} />);
+
+    const sock = sockets[0]!;
+    const now = Date.now();
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "ABCD",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: now + 55_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+
+    // Tap Bob on the left rail
+    const bobNode = screen.getByTestId("rail-player-p2");
+    await user.click(bobNode);
+
+    expect(bobNode.className).toContain("selected");
+    expect(screen.getByTestId("whisper-target-pill")).toHaveTextContent("Bob");
+    const input = screen.getByPlaceholderText(/Whisper secretly to Bob/i);
+    expect(input.className).toContain("whisper-mode");
+
+    // Send a whisper -> emits send_whisper and auto-resets composer to All
+    await user.type(input, "Vote Cara");
+    await user.click(screen.getByRole("button", { name: /^Send$/i }));
+
+    expect(sock.sent).toContainEqual({
+      type: "send_whisper",
+      targetPlayerId: "p2",
+      text: "Vote Cara",
+    });
+    expect(screen.queryByTestId("whisper-target-pill")).not.toBeInTheDocument();
+    expect(
+      screen.getByPlaceholderText(/Plead for your life/i),
+    ).toBeInTheDocument();
+
+    // Independent cooldown: public chat works immediately after whisper
+    const publicInput = screen.getByPlaceholderText(/Plead for your life/i);
+    await user.type(publicInput, "Spare me!");
+    await user.click(screen.getByRole("button", { name: /^Send$/i }));
+    expect(sock.sent).toContainEqual({
+      type: "send_chat",
+      text: "Spare me!",
+    });
+
+    // Receive whisper_message and whisper_intercepted
+    act(() => {
+      sock.emitServerMessage({
+        type: "whisper_message",
+        id: "w1",
+        senderId: "p1",
+        senderName: "Alice",
+        senderAvatarId: "skull",
+        targetId: "p2",
+        targetName: "Bob",
+        text: "Vote Cara",
+        timestamp: now + 1000,
+      });
+      sock.emitServerMessage({
+        type: "whisper_intercepted",
+        id: "leak1",
+        whisperId: "w1",
+        senderId: "p1",
+        senderName: "Alice",
+        targetId: "p2",
+        targetName: "Bob",
+        headerText: "I overheard Alice whispering to Bob:",
+        whisperText: "Vote Cara",
+        timestamp: now + 2000,
+      });
+    });
+
+    expect(screen.getByText(/Whisper to Bob/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/I overheard Alice whispering to Bob:/i),
+    ).toBeInTheDocument();
+    const quote = screen.getByTestId("intercepted-whisper-quote");
+    expect(quote).toHaveTextContent("Vote Cara");
+  });
+
+  it("disables Whisper targeting when <= 2 living players remain", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/room/ABCD");
+    render(<App createSocket={createSocket} />);
+
+    const sock = sockets[0]!;
+    const now = Date.now();
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "ABCD",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: now + 60_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+
+    const bobNode = screen.getByTestId("rail-player-p2");
+    await user.click(bobNode);
+    expect(screen.queryByTestId("whisper-target-pill")).not.toBeInTheDocument();
+  });
 });

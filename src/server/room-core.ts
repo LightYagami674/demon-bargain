@@ -5,8 +5,11 @@ import {
   MAX_CHAT_LENGTH,
   MAX_FEED_ITEMS,
   MAX_PLAYERS,
+  MAX_WHISPER_LENGTH,
   MIN_CHAT_LENGTH,
   MIN_PLAYERS,
+  MIN_PLAYERS_FOR_WHISPERS,
+  MIN_WHISPER_LENGTH,
   MOOD_ROTATION_MS,
   PRESET_AVATARS,
   RECENT_CONTEXT_LIMIT,
@@ -20,6 +23,12 @@ import {
   SUDDEN_DEATH_CLAMP_DOOM,
   SUDDEN_DEATH_DURATION_MS,
   WAITING_DISCONNECT_GRACE_MS,
+  WHISPER_COOLDOWN_MS,
+  WHISPER_INTERCEPT_BATCH_SIZE,
+  WHISPER_INTERCEPT_CANDIDATE_LIMIT,
+  WHISPER_INTERCEPT_DOOM_PENALTY,
+  WHISPER_INTERCEPT_FALLBACK_REMAINING_MS,
+  WHISPER_INTERCEPT_MIN_GAP_MS,
   getRoundDurationMs,
   softResetDoom,
   type PresetAvatarId,
@@ -86,6 +95,30 @@ interface InternalPlayer {
   doom: number;
   disconnectGraceEndsAt: number | null;
   lastChatAt: number | null;
+  lastWhisperAt: number | null;
+  leakedWhisperCount: number;
+}
+
+interface RoundWhisper {
+  id: string;
+  senderId: string;
+  senderName: string;
+  targetId: string;
+  targetName: string;
+  text: string;
+  timestamp: number;
+  leaked: boolean;
+}
+
+export interface LeakedWhisperSummary {
+  whisperId: string;
+  senderId: string;
+  senderName: string;
+  targetId: string;
+  targetName: string;
+  text: string;
+  round: number;
+  timestamp: number;
 }
 
 interface PersistedRoomState {
@@ -111,6 +144,12 @@ interface PersistedRoomState {
   resolvingCapAt?: number | null;
   emptySince?: number | null;
   lastActivityAt?: number | null;
+  roundWhispers?: RoundWhisper[];
+  lastWhisperInterceptAt?: number | null;
+  roundWhisperInterceptCount?: number;
+  whisperFallbackTriggered?: boolean;
+  whisperFallbackAt?: number | null;
+  lastLeakedWhisper?: LeakedWhisperSummary | null;
 }
 
 export class RoomCore {
@@ -146,6 +185,13 @@ export class RoomCore {
   private pendingEvaluations = new Set<Promise<void>>();
   private emptySince: number | null = null;
   private lastActivityAt: number | null = null;
+  private roundWhispers: RoundWhisper[] = [];
+  private lastWhisperInterceptAt: number | null = null;
+  private roundWhisperInterceptCount = 0;
+  private whisperFallbackTriggered = false;
+  private whisperFallbackAt: number | null = null;
+  private lastLeakedWhisper: LeakedWhisperSummary | null = null;
+  private whisperInterceptInFlight = false;
   private connectionToPlayerId = new Map<string, string>();
   private playerIdToConnectionId = new Map<string, string>();
 
@@ -177,6 +223,8 @@ export class RoomCore {
         this.players = (parsed.players ?? []).map((p) => ({
           ...p,
           lastChatAt: p.lastChatAt ?? null,
+          lastWhisperAt: p.lastWhisperAt ?? null,
+          leakedWhisperCount: p.leakedWhisperCount ?? 0,
         }));
         this.entityMood = parsed.entityMood ?? "SADIST";
         this.previousRoundMood = parsed.previousRoundMood ?? null;
@@ -191,6 +239,13 @@ export class RoomCore {
         this.resolvingCapAt = parsed.resolvingCapAt ?? null;
         this.emptySince = parsed.emptySince ?? null;
         this.lastActivityAt = parsed.lastActivityAt ?? null;
+        this.roundWhispers = parsed.roundWhispers ?? [];
+        this.lastWhisperInterceptAt = parsed.lastWhisperInterceptAt ?? null;
+        this.roundWhisperInterceptCount = parsed.roundWhisperInterceptCount ?? 0;
+        this.whisperFallbackTriggered =
+          parsed.whisperFallbackTriggered ?? false;
+        this.whisperFallbackAt = parsed.whisperFallbackAt ?? null;
+        this.lastLeakedWhisper = parsed.lastLeakedWhisper ?? null;
       } catch {
         // Ignore corrupted persisted state and start fresh
       }
@@ -231,6 +286,21 @@ export class RoomCore {
     this.persist();
   }
 
+  /** Per-player leaked Whisper stats for POST_MATCH awards (#24) */
+  getWhisperStatsForMatch(): {
+    leakedCountByPlayerId: Record<string, number>;
+    lastLeakedWhisper: LeakedWhisperSummary | null;
+  } {
+    const leakedCountByPlayerId: Record<string, number> = {};
+    for (const p of this.players) {
+      leakedCountByPlayerId[p.id] = p.leakedWhisperCount;
+    }
+    return {
+      leakedCountByPlayerId,
+      lastLeakedWhisper: this.lastLeakedWhisper,
+    };
+  }
+
   onMessage(connectionId: string, rawMessage: string): void {
     let parsedJson: unknown;
     try {
@@ -267,6 +337,9 @@ export class RoomCore {
         return;
       case "send_chat":
         this.handleSendChat(connectionId, msg.text);
+        return;
+      case "send_whisper":
+        this.handleSendWhisper(connectionId, msg.targetPlayerId, msg.text);
         return;
       case "leave_room":
         this.handleLeaveRoom(connectionId);
@@ -402,19 +475,49 @@ export class RoomCore {
         this.advanceMatchPhase(now);
       } else if (
         this.phase === "IN_MATCH" &&
-        this.matchPhase === "ROUND_ACTIVE" &&
-        !this.isSuddenDeath &&
-        this.nextMoodRotationAt !== null &&
-        now >= this.nextMoodRotationAt
+        this.matchPhase === "ROUND_ACTIVE"
       ) {
-        this.entityMood = pickNextMood(this.entityMood, this.random);
-        const hint = this.copyEngine.drawMoodHint(this.entityMood);
-        this.nextMoodRotationAt =
-          this.phaseEndsAt !== null && now + MOOD_ROTATION_MS < this.phaseEndsAt
-            ? now + MOOD_ROTATION_MS
-            : null;
-        this.persist();
-        this.emitEntityAnnouncement("MOOD_SHIFT", hint, now);
+        if (
+          !this.isSuddenDeath &&
+          this.nextMoodRotationAt !== null &&
+          now >= this.nextMoodRotationAt
+        ) {
+          this.entityMood = pickNextMood(this.entityMood, this.random);
+          const hint = this.copyEngine.drawMoodHint(this.entityMood);
+          this.nextMoodRotationAt =
+            this.phaseEndsAt !== null && now + MOOD_ROTATION_MS < this.phaseEndsAt
+              ? now + MOOD_ROTATION_MS
+              : null;
+          this.persist();
+          this.emitEntityAnnouncement("MOOD_SHIFT", hint, now);
+        }
+
+        if (
+          !this.whisperFallbackTriggered &&
+          this.whisperFallbackAt !== null &&
+          now >= this.whisperFallbackAt
+        ) {
+          this.whisperFallbackTriggered = true;
+          const unleaked = this.roundWhispers.filter((w) => !w.leaked);
+          if (
+            this.roundWhisperInterceptCount === 0 &&
+            unleaked.length >= 1 &&
+            unleaked.length < WHISPER_INTERCEPT_BATCH_SIZE
+          ) {
+            this.triggerWhisperInterception(unleaked, now);
+          } else {
+            this.persist();
+          }
+        } else {
+          const unleaked = this.roundWhispers.filter((w) => !w.leaked);
+          if (
+            unleaked.length >= WHISPER_INTERCEPT_BATCH_SIZE &&
+            (this.lastWhisperInterceptAt === null ||
+              now - this.lastWhisperInterceptAt >= WHISPER_INTERCEPT_MIN_GAP_MS)
+          ) {
+            this.triggerWhisperInterception(unleaked, now);
+          }
+        }
       }
     }
 
@@ -434,6 +537,14 @@ export class RoomCore {
         !this.isSuddenDeath && MOOD_ROTATION_MS < durationMs
           ? now + MOOD_ROTATION_MS
           : null;
+      this.roundWhispers = [];
+      this.lastWhisperInterceptAt = null;
+      this.roundWhisperInterceptCount = 0;
+      this.whisperFallbackTriggered = false;
+      this.whisperFallbackAt =
+        durationMs > WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
+          ? this.phaseEndsAt - WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
+          : null;
       this.persist();
       this.broadcastPhaseChanged(now);
       return;
@@ -442,6 +553,7 @@ export class RoomCore {
     if (this.matchPhase === "ROUND_ACTIVE") {
       this.matchPhase = "ROUND_RESOLVING";
       this.nextMoodRotationAt = null;
+      this.whisperFallbackAt = null;
       const resolvingMs =
         this.pendingEvaluations.size > 0
           ? ROUND_RESOLVING_MAX_MS
@@ -579,6 +691,8 @@ export class RoomCore {
       doom: INITIAL_DOOM,
       disconnectGraceEndsAt: null,
       lastChatAt: null,
+      lastWhisperAt: null,
+      leakedWhisperCount: 0,
     };
 
     this.players.push(player);
@@ -729,9 +843,15 @@ export class RoomCore {
     this.isSuddenDeath = false;
     this.roundId = this.generateId();
     this.roundPublicMessages = [];
+    this.roundWhispers = [];
+    this.lastWhisperInterceptAt = null;
+    this.roundWhisperInterceptCount = 0;
+    this.whisperFallbackTriggered = false;
+    this.whisperFallbackAt = null;
     this.lastSpamMockeryAt = null;
     this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
+    this.lastLeakedWhisper = null;
     this.entityMood = pickNextMood(null, this.random);
     this.previousRoundMood = this.entityMood;
     const introText = this.copyEngine.drawBeat("ROUND_INTRO_FIRST");
@@ -742,6 +862,8 @@ export class RoomCore {
       p.alive = true;
       p.doom = INITIAL_DOOM;
       p.lastChatAt = null;
+      p.lastWhisperAt = null;
+      p.leakedWhisperCount = 0;
     }
 
     this.persist();
@@ -859,6 +981,288 @@ export class RoomCore {
         });
       this.pendingEvaluations.add(evalPromise);
     }
+  }
+
+  private handleSendWhisper(
+    connectionId: string,
+    targetPlayerId: string,
+    rawText: string,
+  ): void {
+    const player = this.getAuthenticatedPlayer(connectionId);
+    if (!player) return;
+
+    if (this.phase !== "IN_MATCH" || this.matchPhase !== "ROUND_ACTIVE") {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Whispers are only open during an active round.",
+      );
+      return;
+    }
+
+    if (!player.alive) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Ghosts cannot send Whispers.",
+      );
+      return;
+    }
+
+    const livingCount = this.players.filter((p) => p.alive).length;
+    if (livingCount < MIN_PLAYERS_FOR_WHISPERS) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Whispers are disabled when 2 or fewer living players remain.",
+      );
+      return;
+    }
+
+    if (targetPlayerId === player.id) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Cannot Whisper to yourself.",
+      );
+      return;
+    }
+
+    const target = this.players.find(
+      (p) => p.id === targetPlayerId && p.alive,
+    );
+    if (!target) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        "Whisper target must be another living player.",
+      );
+      return;
+    }
+
+    const text = rawText.trim();
+    if (text.length < MIN_WHISPER_LENGTH || text.length > MAX_WHISPER_LENGTH) {
+      this.sendError(
+        connectionId,
+        "INVALID_PAYLOAD",
+        `Whisper must be ${MIN_WHISPER_LENGTH}–${MAX_WHISPER_LENGTH} characters.`,
+      );
+      return;
+    }
+
+    const now = this.clock();
+    if (
+      player.lastWhisperAt !== null &&
+      now - player.lastWhisperAt < WHISPER_COOLDOWN_MS
+    ) {
+      const retryAfterMs = WHISPER_COOLDOWN_MS - (now - player.lastWhisperAt);
+      this.sendError(
+        connectionId,
+        "COOLDOWN_ACTIVE",
+        "Wait before whispering again.",
+        retryAfterMs,
+      );
+      return;
+    }
+
+    player.lastWhisperAt = now;
+    const id = this.generateId();
+
+    this.roundWhispers.push({
+      id,
+      senderId: player.id,
+      senderName: player.name,
+      targetId: target.id,
+      targetName: target.name,
+      text,
+      timestamp: now,
+      leaked: false,
+    });
+
+    this.pushFeedItem({
+      kind: "whisper",
+      id,
+      senderId: player.id,
+      senderName: player.name,
+      senderAvatarId: player.avatarId,
+      targetId: target.id,
+      targetName: target.name,
+      text,
+      timestamp: now,
+    });
+    this.persist();
+
+    const payload: ServerMessage = {
+      type: "whisper_message",
+      id,
+      senderId: player.id,
+      senderName: player.name,
+      senderAvatarId: player.avatarId,
+      targetId: target.id,
+      targetName: target.name,
+      text,
+      timestamp: now,
+    };
+
+    const senderConnId = this.playerIdToConnectionId.get(player.id);
+    if (senderConnId) {
+      this.send(senderConnId, payload);
+    }
+    const targetConnId = this.playerIdToConnectionId.get(target.id);
+    if (targetConnId && targetConnId !== senderConnId) {
+      this.send(targetConnId, payload);
+    }
+
+    const unleaked = this.roundWhispers.filter((w) => !w.leaked);
+    if (
+      unleaked.length >= WHISPER_INTERCEPT_BATCH_SIZE &&
+      (this.lastWhisperInterceptAt === null ||
+        now - this.lastWhisperInterceptAt >= WHISPER_INTERCEPT_MIN_GAP_MS)
+    ) {
+      this.triggerWhisperInterception(unleaked, now);
+    }
+    this.rescheduleAlarm();
+  }
+
+  private triggerWhisperInterception(
+    unleaked: RoundWhisper[],
+    _now: number,
+  ): void {
+    if (this.whisperInterceptInFlight || unleaked.length === 0) return;
+
+    const candidates = unleaked.slice(-WHISPER_INTERCEPT_CANDIDATE_LIMIT);
+    const roundId = this.roundId;
+
+    if (candidates.length === 1 || !this.jevEvaluator) {
+      this.applyWhisperInterception(roundId, candidates[0]!.id);
+      return;
+    }
+
+    this.whisperInterceptInFlight = true;
+    const evalPromise = this.jevEvaluator
+      .pickInterceptedWhisper({
+        roundId,
+        entityMood: this.entityMood,
+        candidates: candidates.map((c) => ({
+          id: c.id,
+          senderName: c.senderName,
+          targetName: c.targetName,
+          text: c.text,
+        })),
+      })
+      .then((res) => {
+        this.applyWhisperInterception(res.roundId, res.whisperId);
+      })
+      .catch(() => {
+        this.handleJudgeFailure(roundId);
+      })
+      .finally(() => {
+        this.whisperInterceptInFlight = false;
+        this.pendingEvaluations.delete(evalPromise);
+      });
+    this.pendingEvaluations.add(evalPromise);
+  }
+
+  private applyWhisperInterception(roundId: string, whisperId: string): void {
+    if (this.phase !== "IN_MATCH" || roundId !== this.roundId) return;
+    if (
+      this.matchPhase !== "ROUND_ACTIVE" &&
+      this.matchPhase !== "ROUND_RESOLVING"
+    ) {
+      return;
+    }
+    const now = this.clock();
+    if (
+      this.matchPhase === "ROUND_RESOLVING" &&
+      this.resolvingCapAt !== null &&
+      now > this.resolvingCapAt
+    ) {
+      return;
+    }
+
+    const unleaked = this.roundWhispers.filter((w) => !w.leaked);
+    if (unleaked.length === 0) return;
+    const chosen =
+      unleaked.find((w) => w.id === whisperId) ?? unleaked[unleaked.length - 1]!;
+
+    chosen.leaked = true;
+    this.lastWhisperInterceptAt = now;
+    this.roundWhisperInterceptCount += 1;
+
+    const sender = this.players.find((p) => p.id === chosen.senderId);
+    if (sender) {
+      sender.leakedWhisperCount += 1;
+    }
+    this.lastLeakedWhisper = {
+      whisperId: chosen.id,
+      senderId: chosen.senderId,
+      senderName: chosen.senderName,
+      targetId: chosen.targetId,
+      targetName: chosen.targetName,
+      text: chosen.text,
+      round: this.round,
+      timestamp: now,
+    };
+
+    const id = this.generateId();
+    const headerText = this.drawWhisperLeakBeat(
+      chosen.senderName,
+      chosen.targetName,
+    );
+    this.pushFeedItem({
+      kind: "whisper_intercepted",
+      id,
+      whisperId: chosen.id,
+      senderId: chosen.senderId,
+      senderName: chosen.senderName,
+      targetId: chosen.targetId,
+      targetName: chosen.targetName,
+      headerText,
+      whisperText: chosen.text,
+      timestamp: now,
+    });
+
+    const leakPayload: ServerMessage = {
+      type: "whisper_intercepted",
+      id,
+      whisperId: chosen.id,
+      senderId: chosen.senderId,
+      senderName: chosen.senderName,
+      targetId: chosen.targetId,
+      targetName: chosen.targetName,
+      headerText,
+      whisperText: chosen.text,
+      timestamp: now,
+    };
+    this.transport.broadcast(JSON.stringify(leakPayload));
+
+    let sacrificed = false;
+    if (sender && sender.alive) {
+      const oldDoom = sender.doom;
+      const newDoom = Math.min(100, oldDoom + WHISPER_INTERCEPT_DOOM_PENALTY);
+      sender.doom = newDoom;
+      const doomPayload: ServerMessage = {
+        type: "doom_updated",
+        updates: [
+          {
+            playerId: sender.id,
+            doom: newDoom,
+            delta: newDoom - oldDoom,
+          },
+        ],
+        sourceMessageId: id,
+      };
+      this.transport.broadcast(JSON.stringify(doomPayload));
+      if (newDoom >= 100) {
+        sacrificed = true;
+        this.sacrificePlayer(sender, now, "SPIKE");
+      }
+    }
+
+    if (!sacrificed) {
+      this.persist();
+    }
+    this.rescheduleAlarm();
   }
 
   private applyJudgeVerdict(
@@ -1012,6 +1416,14 @@ export class RoomCore {
     this.sacrificedPlayerId = null;
     this.roundId = this.generateId();
     this.roundPublicMessages = [];
+    this.roundWhispers = [];
+    this.lastWhisperInterceptAt = null;
+    this.roundWhisperInterceptCount = 0;
+    this.whisperFallbackTriggered = false;
+    this.whisperFallbackAt =
+      SUDDEN_DEATH_DURATION_MS > WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
+        ? now + SUDDEN_DEATH_DURATION_MS - WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
+        : null;
     this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.entityMood = pickNextMood(this.entityMood, this.random);
@@ -1267,6 +1679,16 @@ export class RoomCore {
       now - recipient.lastChatAt < CHAT_COOLDOWN_MS
         ? recipient.lastChatAt + CHAT_COOLDOWN_MS
         : null;
+    const whisperCooldownEndsAt =
+      recipient.lastWhisperAt !== null &&
+      now - recipient.lastWhisperAt < WHISPER_COOLDOWN_MS
+        ? recipient.lastWhisperAt + WHISPER_COOLDOWN_MS
+        : null;
+    const visibleFeed = this.feed.filter((item) => {
+      if (item.kind !== "whisper") return true;
+      if (this.phase === "POST_MATCH") return false;
+      return item.senderId === recipient.id || item.targetId === recipient.id;
+    });
     this.send(connectionId, {
       type: "room_snapshot",
       roomCode: this.roomCode,
@@ -1282,8 +1704,9 @@ export class RoomCore {
       sacrificedPlayerId: this.sacrificedPlayerId,
       winnerId: this.winnerId,
       endReason: this.endReason,
-      feed: this.feed,
+      feed: visibleFeed,
       chatCooldownEndsAt,
+      whisperCooldownEndsAt,
     });
   }
 
@@ -1387,12 +1810,24 @@ export class RoomCore {
 
     if (this.phase === "IN_MATCH") {
       consider(this.phaseEndsAt);
-      if (
-        this.matchPhase === "ROUND_ACTIVE" &&
-        !this.isSuddenDeath &&
-        this.nextMoodRotationAt !== null
-      ) {
-        consider(this.nextMoodRotationAt);
+      if (this.matchPhase === "ROUND_ACTIVE") {
+        if (!this.isSuddenDeath && this.nextMoodRotationAt !== null) {
+          consider(this.nextMoodRotationAt);
+        }
+        if (
+          !this.whisperFallbackTriggered &&
+          this.roundWhisperInterceptCount === 0 &&
+          this.whisperFallbackAt !== null
+        ) {
+          consider(this.whisperFallbackAt);
+        }
+        if (
+          this.lastWhisperInterceptAt !== null &&
+          this.roundWhispers.filter((w) => !w.leaked).length >=
+            WHISPER_INTERCEPT_BATCH_SIZE
+        ) {
+          consider(this.lastWhisperInterceptAt + WHISPER_INTERCEPT_MIN_GAP_MS);
+        }
       }
     }
     for (const p of this.players) {
@@ -1436,6 +1871,12 @@ export class RoomCore {
       resolvingCapAt: this.resolvingCapAt,
       emptySince: this.emptySince,
       lastActivityAt: this.lastActivityAt,
+      roundWhispers: this.roundWhispers,
+      lastWhisperInterceptAt: this.lastWhisperInterceptAt,
+      roundWhisperInterceptCount: this.roundWhisperInterceptCount,
+      whisperFallbackTriggered: this.whisperFallbackTriggered,
+      whisperFallbackAt: this.whisperFallbackAt,
+      lastLeakedWhisper: this.lastLeakedWhisper,
     };
     this.storage.save(JSON.stringify(state));
   }

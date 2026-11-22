@@ -28,6 +28,16 @@ export const MIN_CHAT_LENGTH = 2;
 export const MAX_CHAT_LENGTH = 200;
 export const MAX_FEED_ITEMS = 200;
 
+export const WHISPER_COOLDOWN_MS = 2_500;
+export const MIN_WHISPER_LENGTH = 1;
+export const MAX_WHISPER_LENGTH = 160;
+export const MIN_PLAYERS_FOR_WHISPERS = 3;
+export const WHISPER_INTERCEPT_BATCH_SIZE = 4;
+export const WHISPER_INTERCEPT_MIN_GAP_MS = 15_000;
+export const WHISPER_INTERCEPT_FALLBACK_REMAINING_MS = 25_000;
+export const WHISPER_INTERCEPT_CANDIDATE_LIMIT = 12;
+export const WHISPER_INTERCEPT_DOOM_PENALTY = 8;
+
 const ROUND_DURATION_BY_LIVING_MS: Record<number, number> = {
   6: 90_000,
   5: 75_000,
