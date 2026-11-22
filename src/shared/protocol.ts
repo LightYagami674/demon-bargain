@@ -76,7 +76,6 @@ export const FeedItemSchema = z.discriminatedUnion("kind", [
     avatarId: PresetAvatarIdSchema,
     text: z.string(),
     timestamp: z.number(),
-    doomDelta: z.number().int().optional(),
   }),
   z.object({
     kind: z.literal("entity"),
@@ -248,6 +247,17 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     winnerId: z.string().nullable().optional(),
     endReason: MatchEndReasonSchema.nullable().optional(),
     postMatchSummary: PostMatchSummarySchema.nullable().optional(),
+  }),
+  z.object({
+    type: z.literal("match_ended"),
+    roomStatus: z.literal("POST_MATCH"),
+    round: z.number().int().min(0),
+    totalRounds: z.number().int().min(0),
+    serverNow: z.number(),
+    players: z.array(PublicPlayerSchema),
+    winnerId: z.string().nullable(),
+    endReason: MatchEndReasonSchema,
+    postMatchSummary: PostMatchSummarySchema,
   }),
   z.object({
     type: z.literal("chat_message"),

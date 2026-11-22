@@ -234,7 +234,7 @@ export class TypeSafeJevEvaluator implements JevEvaluator {
               "Is the message low-effort spam, gibberish, keyboard mashing, or empty filler?",
               {
                 true: "Repeated characters, random letters, or zero-effort filler",
-                false: "A coherent in-game plea or accusation",
+                false: "A coherent in-Match plea or accusation",
               },
             ),
             ...curseQuestions,

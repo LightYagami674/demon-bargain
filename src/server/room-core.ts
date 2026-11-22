@@ -535,6 +535,7 @@ export class RoomCore {
           this.emitEntityAnnouncement("MOOD_SHIFT", hint, now);
         }
 
+        let interceptedInFallback = false;
         if (
           !this.whisperFallbackTriggered &&
           this.whisperFallbackAt !== null &&
@@ -547,19 +548,14 @@ export class RoomCore {
             unleaked.length >= 1 &&
             unleaked.length < WHISPER_INTERCEPT_BATCH_SIZE
           ) {
-            this.triggerWhisperInterception(unleaked, now);
+            this.triggerWhisperInterception(unleaked);
+            interceptedInFallback = true;
           } else {
             this.persist();
           }
-        } else {
-          const unleaked = this.roundWhispers.filter((w) => !w.leaked);
-          if (
-            unleaked.length >= WHISPER_INTERCEPT_BATCH_SIZE &&
-            (this.lastWhisperInterceptAt === null ||
-              now - this.lastWhisperInterceptAt >= WHISPER_INTERCEPT_MIN_GAP_MS)
-          ) {
-            this.triggerWhisperInterception(unleaked, now);
-          }
+        }
+        if (!interceptedInFallback) {
+          this.maybeTriggerBatchWhisperInterception(now);
         }
       }
     }
@@ -1312,21 +1308,22 @@ export class RoomCore {
       this.send(targetConnId, payload);
     }
 
+    this.maybeTriggerBatchWhisperInterception(now);
+    this.rescheduleAlarm();
+  }
+
+  private maybeTriggerBatchWhisperInterception(now: number): void {
     const unleaked = this.roundWhispers.filter((w) => !w.leaked);
     if (
       unleaked.length >= WHISPER_INTERCEPT_BATCH_SIZE &&
       (this.lastWhisperInterceptAt === null ||
         now - this.lastWhisperInterceptAt >= WHISPER_INTERCEPT_MIN_GAP_MS)
     ) {
-      this.triggerWhisperInterception(unleaked, now);
+      this.triggerWhisperInterception(unleaked);
     }
-    this.rescheduleAlarm();
   }
 
-  private triggerWhisperInterception(
-    unleaked: RoundWhisper[],
-    _now: number,
-  ): void {
+  private triggerWhisperInterception(unleaked: RoundWhisper[]): void {
     if (this.whisperInterceptInFlight || unleaked.length === 0) return;
 
     const candidates = unleaked.slice(-WHISPER_INTERCEPT_CANDIDATE_LIMIT);
@@ -1771,6 +1768,7 @@ export class RoomCore {
     this.persist();
     this.rescheduleAlarm();
     this.broadcastPhaseChanged(now);
+    this.broadcastMatchEnded(now);
     this.emitEntityAnnouncement(
       "POST_MATCH_JUDGE_ERROR",
       POST_MATCH_JUDGE_ERROR,
@@ -1927,6 +1925,7 @@ export class RoomCore {
     this.postMatchClosingBeat = closingText;
     this.persist();
     this.broadcastPhaseChanged(now);
+    this.broadcastMatchEnded(now);
     this.logger.info("match_ended", {
       roomCode: this.roomCode,
       endReason: this.endReason,
@@ -2203,6 +2202,23 @@ export class RoomCore {
       winnerId: this.winnerId,
       endReason: this.endReason,
       postMatchSummary: this.buildPostMatchSummary(),
+    };
+    this.transport.broadcast(JSON.stringify(payload));
+  }
+
+  private broadcastMatchEnded(now: number): void {
+    const postMatchSummary = this.buildPostMatchSummary();
+    if (!this.endReason || !postMatchSummary) return;
+    const payload: ServerMessage = {
+      type: "match_ended",
+      roomStatus: "POST_MATCH",
+      round: this.round,
+      totalRounds: this.totalRounds,
+      serverNow: now,
+      players: this.toPublicPlayers(),
+      winnerId: this.winnerId,
+      endReason: this.endReason,
+      postMatchSummary,
     };
     this.transport.broadcast(JSON.stringify(payload));
   }

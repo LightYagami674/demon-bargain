@@ -482,4 +482,42 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
       bobPostSnap.feed?.some((f) => f.kind === "whisper_intercepted"),
     ).toBe(true);
   });
+
+  it("runs batch interception when whisperFallbackAt fires with >= 4 queued un-leaked whispers after the 15s gap", async () => {
+    const { h, alice, bob, cara } = setupThreePlayerActiveRound();
+
+    // Batch 1: 4 whispers at t=0..2.5s triggers first interception
+    h.send("c1", { type: "send_whisper", targetPlayerId: bob.playerId, text: "b1-1" });
+    h.send("c2", { type: "send_whisper", targetPlayerId: cara.playerId, text: "b1-2" });
+    h.send("c3", { type: "send_whisper", targetPlayerId: alice.playerId, text: "b1-3" });
+    h.advanceTime(WHISPER_COOLDOWN_MS);
+    h.send("c1", { type: "send_whisper", targetPlayerId: cara.playerId, text: "b1-4" });
+    await h.room.flushPendingEvaluations();
+
+    expect(
+      h.sent("c1").filter((m) => m.type === "whisper_intercepted"),
+    ).toHaveLength(1);
+
+    // Queue 4 more whispers within the 15s min-gap window (at t=5s..7.5s)
+    h.advanceTime(WHISPER_COOLDOWN_MS);
+    h.send("c1", { type: "send_whisper", targetPlayerId: bob.playerId, text: "b2-1" });
+    h.send("c2", { type: "send_whisper", targetPlayerId: cara.playerId, text: "b2-2" });
+    h.send("c3", { type: "send_whisper", targetPlayerId: alice.playerId, text: "b2-3" });
+    h.advanceTime(WHISPER_COOLDOWN_MS);
+    h.send("c1", { type: "send_whisper", targetPlayerId: cara.playerId, text: "b2-4" });
+    await h.room.flushPendingEvaluations();
+
+    // Still only 1 interception because 15s gap has not elapsed
+    expect(
+      h.sent("c1").filter((m) => m.type === "whisper_intercepted"),
+    ).toHaveLength(1);
+
+    // Advance to whisperFallbackAt (30s into 55s round, >15s after batch 1)
+    h.advanceTime(22_500);
+    await h.room.flushPendingEvaluations();
+
+    expect(
+      h.sent("c1").filter((m) => m.type === "whisper_intercepted"),
+    ).toHaveLength(2);
+  });
 });

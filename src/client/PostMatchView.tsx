@@ -7,6 +7,7 @@ import type {
   PostMatchSummary,
   PublicPlayer,
 } from "../shared/protocol.js";
+import { FeedCard } from "./FeedCard.js";
 
 const CAUSE_LABEL: Record<EliminationCause, string> = {
   TIMER: "Claimed by Doom",
@@ -250,47 +251,9 @@ export function PostMatchView({
                   No public messages recorded in this Match.
                 </p>
               ) : (
-                publicLogItems.map((item) => {
-                  if (item.kind === "entity") {
-                    return (
-                      <div
-                        key={item.id}
-                        className="rounded-xl border border-rose-600/50 bg-[#200a12]/95 px-3 py-2 text-xs italic text-rose-100"
-                      >
-                        {item.text}
-                      </div>
-                    );
-                  }
-                  if (item.kind === "whisper_intercepted") {
-                    return (
-                      <div
-                        key={item.id}
-                        className="rounded-xl border border-rose-500 bg-[#3a0c1e]/95 px-3 py-2 text-xs text-rose-100 space-y-1"
-                      >
-                        <p className="font-semibold italic text-rose-200">
-                          {item.headerText}
-                        </p>
-                        <blockquote className="border-l-2 border-purple-400/70 pl-2 text-purple-100">
-                          {item.whisperText}
-                        </blockquote>
-                      </div>
-                    );
-                  }
-                  if (item.kind === "chat") {
-                    return (
-                      <div
-                        key={item.id}
-                        className="rounded-xl border border-zinc-800 bg-zinc-900/90 px-3 py-2 text-xs text-zinc-100"
-                      >
-                        <span className="font-bold text-zinc-300 mr-1.5">
-                          {item.playerName}:
-                        </span>
-                        <span>{item.text}</span>
-                      </div>
-                    );
-                  }
-                  return null;
-                })
+                publicLogItems.map((item) => (
+                  <FeedCard key={item.id} item={item} compact />
+                ))
               )}
             </div>
           </div>

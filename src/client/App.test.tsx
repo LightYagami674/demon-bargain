@@ -1470,7 +1470,6 @@ describe("SPA Socket Seam — POST_MATCH summary, conditional awards, Match log 
             avatarId: "skull",
             text: "Spare me, O Entity!",
             timestamp: now - 5000,
-            doomDelta: -10,
           },
           {
             kind: "whisper",
@@ -1802,5 +1801,110 @@ describe("SPA Socket Seam — POST_MATCH summary, conditional awards, Match log 
     await user.click(screen.getByRole("button", { name: /leave room/i }));
     expect(sock.sent).toContainEqual({ type: "leave_room" });
     expect(screen.getByRole("button", { name: /create room/i })).toBeInTheDocument();
+  });
+
+  it("transitions to POST_MATCH and strips un-leaked whispers when receiving match_ended directly", async () => {
+    const user = userEvent.setup();
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+    });
+    const now = Date.now();
+    const players = [
+      {
+        id: "p1",
+        name: "Alice",
+        avatarId: "skull" as const,
+        isHost: true,
+        connected: true,
+        joinedAt: now,
+        alive: true,
+        doom: 42,
+      },
+      {
+        id: "p2",
+        name: "Bob",
+        avatarId: "raven" as const,
+        isHost: false,
+        connected: true,
+        joinedAt: now + 100,
+        alive: false,
+        doom: 100,
+      },
+    ];
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "END1",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 1,
+        selfPlayerId: "p1",
+        playerToken: "tok-1",
+        serverNow: now,
+        phaseEndsAt: now + 30_000,
+        players,
+        feed: [
+          {
+            kind: "chat",
+            id: "f1",
+            playerId: "p1",
+            playerName: "Alice",
+            avatarId: "skull",
+            text: "Public plea",
+            timestamp: now - 5000,
+          },
+          {
+            kind: "whisper",
+            id: "f2",
+            senderId: "p1",
+            senderName: "Alice",
+            senderAvatarId: "skull",
+            targetId: "p2",
+            targetName: "Bob",
+            text: "Secret whisper",
+            timestamp: now - 4000,
+          },
+        ],
+      });
+    });
+
+    act(() => {
+      sock.emitServerMessage({
+        type: "match_ended",
+        roomStatus: "POST_MATCH",
+        round: 1,
+        totalRounds: 1,
+        serverNow: now,
+        players,
+        winnerId: "p1",
+        endReason: "SURVIVOR",
+        postMatchSummary: {
+          endReason: "SURVIVOR",
+          winnerId: "p1",
+          closingBeat: "Alice walks out alone.",
+          eliminations: [
+            {
+              round: 1,
+              playerId: "p2",
+              playerName: "Bob",
+              avatarId: "raven",
+              cause: "SPIKE",
+            },
+          ],
+          awards: [],
+        },
+      });
+    });
+
+    expect(screen.getByTestId("post-match-screen")).toBeInTheDocument();
+    expect(screen.getByText(/Alice walks out alone\./i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /view match log/i }));
+    expect(screen.getByText(/Public plea/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Secret whisper/i)).not.toBeInTheDocument();
   });
 });

@@ -439,6 +439,30 @@ function RoomView({
           });
           break;
         }
+        case "match_ended": {
+          setErrorBanner(null);
+          setSnapshot((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              phase: msg.roomStatus,
+              matchPhase: null,
+              round: msg.round,
+              totalRounds: msg.totalRounds,
+              phaseEndsAt: null,
+              clockOffsetMs: msg.serverNow - Date.now(),
+              players: msg.players,
+              sacrificedPlayerId: null,
+              winnerId: msg.winnerId,
+              endReason: msg.endReason,
+              postMatchSummary: msg.postMatchSummary,
+              feed: prev.feed.filter((item) => item.kind !== "whisper"),
+              activeCurses: [],
+              curseCooldownEndsAt: null,
+            };
+          });
+          break;
+        }
         case "chat_message": {
           setSnapshot((prev) => {
             if (!prev) return prev;

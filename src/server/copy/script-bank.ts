@@ -80,7 +80,7 @@ export const MOOD_HINT_POOLS: Record<EntityMood, readonly string[]> = {
 } as const;
 
 /**
- * Curated 102-line Game Beat bank (17 uniform 6-line pools, <= 110 chars each, plain text).
+ * Curated 102-line Match Beat bank (17 uniform 6-line pools, <= 110 chars each, plain text).
  * Approved in Issue #14. Server-only.
  */
 export const BEAT_POOLS = {

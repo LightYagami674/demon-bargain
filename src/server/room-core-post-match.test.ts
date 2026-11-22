@@ -410,4 +410,66 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
       expect(afterGrace.players.map((p) => p.name)).toEqual(["Bob"]);
     }
   });
+
+  it("emits match_ended server event on SURVIVOR and JUDGE_ERROR match endings", async () => {
+    const h = new FakePostMatchHarness();
+    h.send("c1", { type: "join", name: "Alice", avatarId: "skull" });
+    h.send("c2", { type: "join", name: "Bob", avatarId: "raven" });
+    const snap2 = h.lastSnapshot("c2")!;
+    const aliceId = snap2.players.find((p) => p.name === "Alice")!.id;
+    const bobId = snap2.players.find((p) => p.name === "Bob")!.id;
+
+    h.send("c1", { type: "start_match" });
+    h.advanceTime(3500);
+    h.room.setPlayerDoomForMatch(bobId, 95);
+    h.advanceTime(60_000);
+    h.advanceTime(2_000);
+    h.advanceTime(4_500);
+
+    const matchEnded = h
+      .messagesFor("c1")
+      .filter((m) => m.type === "match_ended")
+      .at(-1);
+    expect(matchEnded).toMatchObject({
+      type: "match_ended",
+      roomStatus: "POST_MATCH",
+      endReason: "SURVIVOR",
+      winnerId: aliceId,
+      postMatchSummary: {
+        endReason: "SURVIVOR",
+        winnerId: aliceId,
+      },
+    });
+
+    const failingJev: JevEvaluator = {
+      judgeMessage: async () => {
+        throw new Error("Jev offline");
+      },
+      pickInterceptedWhisper: async () => {
+        throw new Error("Jev offline");
+      },
+    };
+    const hErr = new FakePostMatchHarness(failingJev);
+    hErr.send("c1", { type: "join", name: "Alice", avatarId: "skull" });
+    hErr.send("c2", { type: "join", name: "Bob", avatarId: "raven" });
+    hErr.send("c1", { type: "start_match" });
+    hErr.advanceTime(3500);
+    hErr.send("c1", { type: "send_chat", text: "help me" });
+    await flushAsync();
+
+    const errMatchEnded = hErr
+      .messagesFor("c1")
+      .filter((m) => m.type === "match_ended")
+      .at(-1);
+    expect(errMatchEnded).toMatchObject({
+      type: "match_ended",
+      roomStatus: "POST_MATCH",
+      endReason: "JUDGE_ERROR",
+      winnerId: null,
+      postMatchSummary: {
+        endReason: "JUDGE_ERROR",
+        winnerId: null,
+      },
+    });
+  });
 });
