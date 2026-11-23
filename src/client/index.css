@@ -1,0 +1,152 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    background-color: #09070a;
+    color: #f4f4f5;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+}
+
+/* Selective Doom visual degradation: chrome & rail desaturate while chat stays crisp */
+.degrade-target {
+  filter: saturate(calc(1 - var(--desat, 0)));
+  transition: filter 0.4s ease;
+}
+
+.doom-eye-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 15;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  opacity: var(--eye-opacity, 0);
+  transition: opacity 0.45s ease;
+}
+
+.doom-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  opacity: var(--vignette-opacity, 0);
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 0, 0, 0) 42%,
+    rgba(127, 13, 38, 0.42) 78%,
+    rgba(190, 18, 60, 0.82) 100%
+  );
+  transition: opacity 0.35s ease;
+}
+
+.doom-80 .doom-vignette {
+  animation: vignette-pulse var(--pulse-ms, 920ms) ease-in-out infinite;
+}
+
+.static-flash {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  opacity: 0;
+  background-image: repeating-radial-gradient(
+    circle at 17% 32%,
+    rgba(255, 255, 255, 0.22) 0,
+    rgba(0, 0, 0, 0.4) 2px
+  );
+  background-size: 6px 6px;
+  transition: opacity 0.12s ease;
+}
+
+.static-flash.active {
+  opacity: 0.55;
+}
+
+.doom-50 {
+  animation: micro-tremor 4.2s infinite;
+}
+
+.doom-80 {
+  animation: heavy-tremor 2.4s infinite;
+}
+
+.impact-now {
+  animation: impact-shake 0.35s linear !important;
+}
+
+@keyframes vignette-pulse {
+  0%,
+  100% {
+    opacity: calc(var(--vignette-opacity, 0) * 0.78);
+  }
+  22% {
+    opacity: var(--vignette-opacity, 0);
+  }
+  40% {
+    opacity: calc(var(--vignette-opacity, 0) * 0.92);
+  }
+}
+
+@keyframes micro-tremor {
+  0%,
+  88%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  90% {
+    transform: translate3d(-1.4px, 0.8px, 0);
+  }
+  92% {
+    transform: translate3d(1.4px, -0.8px, 0);
+  }
+  94% {
+    transform: translate3d(-0.9px, -0.5px, 0);
+  }
+  96% {
+    transform: translate3d(0.9px, 0.5px, 0);
+  }
+}
+
+@keyframes heavy-tremor {
+  0%,
+  78%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  81% {
+    transform: translate3d(-2.2px, 1.2px, 0);
+  }
+  84% {
+    transform: translate3d(2.2px, -1.2px, 0);
+  }
+  87% {
+    transform: translate3d(-1.8px, -1px, 0);
+  }
+  91% {
+    transform: translate3d(1.8px, 1px, 0);
+  }
+  94% {
+    transform: translate3d(-1px, 0.6px, 0);
+  }
+}
+
+@keyframes impact-shake {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  20% {
+    transform: translate3d(-4px, 2px, 0);
+  }
+  40% {
+    transform: translate3d(4px, -2px, 0);
+  }
+  60% {
+    transform: translate3d(-3px, -1px, 0);
+  }
+  80% {
+    transform: translate3d(3px, 1px, 0);
+  }
+}
