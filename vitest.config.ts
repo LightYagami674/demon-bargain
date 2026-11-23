@@ -4,6 +4,14 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   test: {
+    poolOptions: {
+      forks: {
+        execArgv: ["--no-experimental-webstorage"],
+      },
+      threads: {
+        execArgv: ["--no-experimental-webstorage"],
+      },
+    },
     projects: [
       {
         extends: true,
