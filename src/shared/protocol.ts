@@ -267,6 +267,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
     avatarId: PresetAvatarIdSchema,
     text: z.string(),
     timestamp: z.number(),
+    pendingJudge: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("whisper_message"),

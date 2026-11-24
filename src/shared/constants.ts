@@ -17,7 +17,6 @@ export const ROUND_INTRO_MS = 3_500;
 export const ROUND_RESOLVING_MS = 2_000;
 export const ROUND_RESOLVING_MAX_MS = 3_000;
 export const SACRIFICE_REVEAL_MS = 4_500;
-export const MOOD_ROTATION_MS = 30_000;
 export const SUDDEN_DEATH_DURATION_MS = 30_000;
 export const SUDDEN_DEATH_CLAMP_DOOM = 95;
 export const SPAM_MOCKERY_COOLDOWN_MS = 5_000;
@@ -54,22 +53,13 @@ export function isValidCurseWord(word: string): boolean {
   return CURSE_WORD_REGEX.test(word);
 }
 
-const ROUND_DURATION_BY_LIVING_MS: Record<number, number> = {
-  6: 90_000,
-  5: 75_000,
-  4: 65_000,
-  3: 55_000,
-  2: 45_000,
-};
+export const ROUND_DURATION_MS = 120_000;
 
 export function getRoundDurationMs(
-  livingCount: number,
-  initialPlayerCount: number,
+  _livingCount?: number,
+  _initialPlayerCount?: number,
 ): number {
-  if (initialPlayerCount <= 2) {
-    return 60_000;
-  }
-  return ROUND_DURATION_BY_LIVING_MS[livingCount] ?? 45_000;
+  return ROUND_DURATION_MS;
 }
 
 export function softResetDoom(currentDoom: number): number {

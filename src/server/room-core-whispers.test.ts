@@ -228,7 +228,7 @@ describe("RoomCore Seam — Secret Whispers & Privacy Isolation", () => {
     const { h, bob, cara } = setupThreePlayerActiveRound();
     h.room.setPlayerDoomForMatch(cara.playerId, 100);
     // Simulate Cara eliminated via ROUND_RESOLVING -> SACRIFICE_REVEAL -> Round 2
-    h.advanceTime(55_000); // ROUND_ACTIVE -> ROUND_RESOLVING
+    h.advanceTime(120_000); // ROUND_ACTIVE -> ROUND_RESOLVING
     h.advanceTime(2_500); // ROUND_RESOLVING -> SACRIFICE_REVEAL
     h.advanceTime(4_500); // SACRIFICE_REVEAL -> Round 2 ROUND_INTRO
     h.advanceTime(ROUND_INTRO_MS); // ROUND_INTRO -> ROUND_ACTIVE (2 living: Alice, Bob)
@@ -402,8 +402,8 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
   it("runs single fallback sweep at 25s remaining, skipping Jev when only 1 candidate exists and skipping when 0 exist", async () => {
     // Case A: 0 whispers -> skips Jev at 25s remaining
     const { h: h0 } = setupThreePlayerActiveRound();
-    // 3 players => 55s round; 25s remaining is at +30s
-    h0.advanceTime(30_000);
+    // 120s round; 25s remaining is at +95s
+    h0.advanceTime(95_000);
     await h0.room.flushPendingEvaluations();
     expect(h0.jev.whisperCalls).toHaveLength(0);
 
@@ -414,7 +414,7 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
       targetPlayerId: bob.playerId,
       text: "Only one secret",
     });
-    h1.advanceTime(30_000);
+    h1.advanceTime(95_000);
     await h1.room.flushPendingEvaluations();
     expect(h1.jev.whisperCalls).toHaveLength(0);
     const leaks = h1
@@ -436,7 +436,7 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
       targetPlayerId: bob.playerId,
       text: "Doomed secret",
     });
-    h.advanceTime(30_000);
+    h.advanceTime(95_000);
     await h.room.flushPendingEvaluations();
 
     const phases = h.sent("c2").filter((m) => m.type === "phase_changed");
@@ -458,7 +458,7 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
       text: "Leaked plot",
     });
     // Trigger fallback sweep at 25s remaining
-    h.advanceTime(30_000);
+    h.advanceTime(95_000);
     await h.room.flushPendingEvaluations();
 
     // Send another un-leaked whisper after the leak
@@ -512,8 +512,8 @@ describe("RoomCore Seam — Hybrid Whisper Interception & Doom Penalty", () => {
       h.sent("c1").filter((m) => m.type === "whisper_intercepted"),
     ).toHaveLength(1);
 
-    // Advance to whisperFallbackAt (30s into 55s round, >15s after batch 1)
-    h.advanceTime(22_500);
+    // Advance to whisperFallbackAt (95s into 120s round, >15s after batch 1)
+    h.advanceTime(87_500);
     await h.room.flushPendingEvaluations();
 
     expect(

@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  ROUND_DURATION_MS,
   generateRoomCode,
+  getRoundDurationMs,
   isValidRoomCode,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
@@ -29,5 +31,15 @@ describe("Room code generation and validation", () => {
     expect(isValidRoomCode("abcd")).toBe(false);
     expect(isValidRoomCode("ABC")).toBe(false);
     expect(isValidRoomCode("ABCDE")).toBe(false);
+  });
+});
+
+describe("Round duration pacing", () => {
+  it("uses a fixed 2-minute (120_000ms) round duration across 2–6 players", () => {
+    expect(ROUND_DURATION_MS).toBe(120_000);
+    expect(getRoundDurationMs(2, 2)).toBe(120_000);
+    for (let living = 2; living <= 6; living++) {
+      expect(getRoundDurationMs(living, 6)).toBe(120_000);
+    }
   });
 });

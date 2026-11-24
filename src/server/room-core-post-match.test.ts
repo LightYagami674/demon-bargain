@@ -182,7 +182,7 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
     await flushAsync();
 
     // Expire Round 1 -> ROUND_RESOLVING -> SACRIFICE_REVEAL (Carol)
-    h.advanceTime(65_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     expect(h.lastPhaseChanged("c1")?.matchPhase).toBe("SACRIFICE_REVEAL");
 
@@ -266,7 +266,7 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
     // Alice stays at 74% (< 75% threshold); Bob hits 95% and is sacrificed at timer end
     h.room.setPlayerDoomForMatch(aliceId, 74);
     h.room.setPlayerDoomForMatch(bobId, 95);
-    h.advanceTime(60_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
 
@@ -319,7 +319,7 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
     h.send("c1", { type: "start_match" });
     h.advanceTime(3500);
     h.room.setPlayerDoomForMatch(bobId, 95);
-    h.advanceTime(60_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
     expect(h.lastPhaseChanged("c1")?.phase).toBe("POST_MATCH");
@@ -365,12 +365,12 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
 
     // End match via Carol & Bob sacrifice
     h.room.setPlayerDoomForMatch(carolId, 95);
-    h.advanceTime(65_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
     h.advanceTime(3_500);
     h.room.setPlayerDoomForMatch(bobId, 95);
-    h.advanceTime(55_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
     expect(h.lastPhaseChanged("c1")?.phase).toBe("POST_MATCH");
@@ -422,7 +422,7 @@ describe("Room WebSocket seam — POST_MATCH summary, conditional awards, log pr
     h.send("c1", { type: "start_match" });
     h.advanceTime(3500);
     h.room.setPlayerDoomForMatch(bobId, 95);
-    h.advanceTime(60_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
 

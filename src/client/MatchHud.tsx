@@ -23,12 +23,45 @@ import type {
   RoomPhase,
 } from "../shared/protocol.js";
 import { computeDoomFxVars, drawEntityEyeFrame } from "./doomFx.js";
-import { FeedCard } from "./FeedCard.js";
+import { FeedCard, type MessageVerdict } from "./FeedCard.js";
 import { SoundEngine, type SoundEngineStatus } from "./audio/soundEngine.js";
 import { getAudioMuted, setAudioMuted } from "./storage.js";
 
 const RING_RADIUS = 16;
 const RING_CIRC = 2 * Math.PI * RING_RADIUS;
+const JUDGE_PENDING_TIMEOUT_MS = 12_000;
+const VERDICT_BANNER_DURATION_MS = 3_500;
+const RAIL_DELTA_FLASH_MS = 3_500;
+
+export interface PlayerDoomFlash {
+  delta: number;
+  doom: number;
+  updatedAt: number;
+  seq: number;
+}
+
+export interface SelfVerdictNotice {
+  messageId: string;
+  delta: number;
+  doom: number;
+  resolvedAt: number;
+}
+
+export interface JudgeFeedbackState {
+  pendingEchoTimestamps: number[];
+  pendingMessageIds: Record<string, number>;
+  messageVerdicts: Record<string, MessageVerdict>;
+  lastSelfVerdict: SelfVerdictNotice | null;
+  playerDoomFlashes: Record<string, PlayerDoomFlash>;
+}
+
+export const EMPTY_JUDGE_FEEDBACK: JudgeFeedbackState = {
+  pendingEchoTimestamps: [],
+  pendingMessageIds: {},
+  messageVerdicts: {},
+  lastSelfVerdict: null,
+  playerDoomFlashes: {},
+};
 
 export interface MatchHudProps {
   roomCode: string;
@@ -48,6 +81,7 @@ export interface MatchHudProps {
   serverWhisperCooldownEndsAt?: number | null;
   activeCurses?: ActiveCurse[];
   curseCooldownEndsAt?: number | null;
+  judgeFeedback?: JudgeFeedbackState;
   reconnecting?: boolean;
   errorBanner: { code?: ErrorCode; message: string } | null;
   onDismissError: () => void;
@@ -95,6 +129,7 @@ export function MatchHud({
   serverWhisperCooldownEndsAt = null,
   activeCurses = [],
   curseCooldownEndsAt = null,
+  judgeFeedback = EMPTY_JUDGE_FEEDBACK,
   reconnecting = false,
   errorBanner,
   onDismissError,
@@ -338,6 +373,28 @@ export function MatchHud({
 
   const countdown = formatCountdown(phaseEndsAt, clockOffsetMs, nowMs);
 
+  const activePendingEchoCount = judgeFeedback.pendingEchoTimestamps.filter(
+    (ts) => nowMs - ts < JUDGE_PENDING_TIMEOUT_MS,
+  ).length;
+  const activePendingMessageIdSet = new Set(
+    Object.entries(judgeFeedback.pendingMessageIds)
+      .filter(([, startedAt]) => nowMs - startedAt < JUDGE_PENDING_TIMEOUT_MS)
+      .map(([id]) => id),
+  );
+  const activePendingTotal =
+    activePendingEchoCount + activePendingMessageIdSet.size;
+  const isJudging =
+    isAlive && phase === "IN_MATCH" && activePendingTotal > 0;
+  const recentSelfVerdict =
+    !isJudging &&
+    isAlive &&
+    phase === "IN_MATCH" &&
+    judgeFeedback.lastSelfVerdict !== null &&
+    nowMs - judgeFeedback.lastSelfVerdict.resolvedAt <
+      VERDICT_BANNER_DURATION_MS
+      ? judgeFeedback.lastSelfVerdict
+      : null;
+
   const sacrificedPlayer = sacrificedPlayerId
     ? players.find((p) => p.id === sacrificedPlayerId) ?? null
     : null;
@@ -545,9 +602,34 @@ export function MatchHud({
             const targetCurseCount = activeCurses.filter(
               (c) => c.targetPlayerId === p.id,
             ).length;
+            const rawFlash = judgeFeedback.playerDoomFlashes[p.id];
+            const activeFlash =
+              p.alive &&
+              rawFlash &&
+              nowMs - rawFlash.updatedAt < RAIL_DELTA_FLASH_MS
+                ? rawFlash
+                : null;
+            const isSelfJudging = isSelf && isJudging;
 
             const nodeContent = (
               <>
+                {activeFlash && (
+                  <span
+                    key={activeFlash.seq}
+                    data-testid={`rail-doom-delta-${p.id}`}
+                    className={`doom-delta-pill absolute -top-1 -left-1 z-10 rounded-full border px-1 font-mono text-[8.5px] font-extrabold leading-tight shadow ${
+                      activeFlash.delta > 0
+                        ? "border-rose-500/80 bg-rose-950 text-rose-200"
+                        : activeFlash.delta < 0
+                          ? "border-emerald-500/80 bg-emerald-950 text-emerald-200"
+                          : "border-zinc-600 bg-zinc-900 text-zinc-200"
+                    }`}
+                  >
+                    {activeFlash.delta > 0
+                      ? `+${activeFlash.delta}%`
+                      : `${activeFlash.delta}%`}
+                  </span>
+                )}
                 {targetCurseCount > 0 && (
                   <span
                     data-testid={`rail-curse-badge-${p.id}`}
@@ -557,7 +639,11 @@ export function MatchHud({
                     🩸{targetCurseCount > 1 ? targetCurseCount : ""}
                   </span>
                 )}
-                <div className="vb-ring-wrap relative w-[38px] h-[38px] flex items-center justify-center">
+                <div
+                  className={`vb-ring-wrap relative w-[38px] h-[38px] flex items-center justify-center ${
+                    isSelfJudging ? "rail-judging" : ""
+                  }`}
+                >
                   <svg
                     width="38"
                     height="38"
@@ -583,6 +669,7 @@ export function MatchHud({
                       strokeDasharray={RING_CIRC}
                       strokeDashoffset={dashOffset}
                       strokeLinecap="round"
+                      className="doom-ring-arc"
                     />
                   </svg>
                   <span className="vb-emoji absolute text-base leading-none z-[2]">
@@ -659,6 +746,7 @@ export function MatchHud({
               <div
                 key={p.id}
                 data-testid={`rail-player-${p.id}`}
+                data-judging={isSelfJudging ? "true" : undefined}
                 className={baseClass}
               >
                 {nodeContent}
@@ -724,6 +812,15 @@ export function MatchHud({
                   key={item.id}
                   item={item}
                   selfPlayerId={selfPlayerId}
+                  judgePending={
+                    item.kind === "chat" &&
+                    activePendingMessageIdSet.has(item.id)
+                  }
+                  verdict={
+                    item.kind === "chat"
+                      ? judgeFeedback.messageVerdicts[item.id]
+                      : undefined
+                  }
                 />
               ))
             )}
@@ -812,10 +909,51 @@ export function MatchHud({
               </div>
             </form>
           ) : (
-            <form
-              onSubmit={handleSubmit}
-              className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1.5"
-            >
+            <>
+              {(isJudging || recentSelfVerdict) && (
+                <div
+                  data-testid="judge-status-indicator"
+                  data-status={isJudging ? "judging" : "completed"}
+                  role="status"
+                  aria-live="polite"
+                  className={`shrink-0 z-[24] border-t px-3 py-1.5 flex items-center gap-2 text-[11.5px] font-semibold ${
+                    isJudging
+                      ? "border-amber-700/50 bg-amber-950/55 text-amber-200"
+                      : recentSelfVerdict!.delta > 0
+                        ? "border-rose-700/60 bg-rose-950/65 text-rose-200"
+                        : recentSelfVerdict!.delta < 0
+                          ? "border-emerald-700/60 bg-emerald-950/60 text-emerald-200"
+                          : "border-zinc-700/70 bg-zinc-900/90 text-zinc-200"
+                  }`}
+                >
+                  {isJudging ? (
+                    <>
+                      <span
+                        data-testid="judge-spinner"
+                        aria-hidden="true"
+                        className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-amber-300/35 border-t-amber-300 animate-spin"
+                      />
+                      <span>
+                        {activePendingTotal > 1
+                          ? `The Entity is judging ${activePendingTotal} pleas...`
+                          : "The Entity is judging your plea..."}
+                      </span>
+                    </>
+                  ) : (
+                    <span>
+                      {recentSelfVerdict!.delta > 0
+                        ? `▲ Verdict in — Doom +${recentSelfVerdict!.delta}% (now ${recentSelfVerdict!.doom}%)`
+                        : recentSelfVerdict!.delta < 0
+                          ? `▼ Verdict in — Doom ${recentSelfVerdict!.delta}% (now ${recentSelfVerdict!.doom}%)`
+                          : `✓ Verdict in — Doom unchanged (${recentSelfVerdict!.doom}%)`}
+                    </span>
+                  )}
+                </div>
+              )}
+              <form
+                onSubmit={handleSubmit}
+                className="composer-wrap shrink-0 z-[25] bg-[#0e0e14]/98 border-t border-[#282838] px-2.5 py-2 space-y-1.5"
+              >
               {whisperTarget && (
                 <div
                   data-testid="whisper-target-pill"
@@ -873,7 +1011,8 @@ export function MatchHud({
                     : "Send"}
                 </button>
               </div>
-            </form>
+              </form>
+            </>
           )}
         </section>
       </div>

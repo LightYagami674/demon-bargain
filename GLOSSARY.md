@@ -29,12 +29,20 @@ A living player's 0%–100% peril gauge that rises or falls in real time based o
 _Avoid_: Health, HP, threat, fear bar
 
 **Entity Mood**:
-The hidden judging lens (`SADIST`, `BLOODHOUND`, `MARTYR_TRAP`, `TYRANT`, `PARANOID`, or `TRICKSTER`) that rotates periodically and governs what kind of plea Jev rewards or punishes.
+The hidden judging lens (`SADIST`, `BLOODHOUND`, `MARTYR_TRAP`, `TYRANT`, `PARANOID`, or `TRICKSTER`) that changes each round and governs what kind of plea Jev rewards or punishes.
 _Avoid_: Mode, state, phase
+
+**Mood Hint**:
+The cryptic clue spoken by the Entity at the start of a round or Sudden Death that signals its hidden Entity Mood.
+_Avoid_: Intro, round intro, prompt
 
 **Whisper**:
 A private one-line message sent directly between two living players that risks being leaked publicly as an intercepted message.
 _Avoid_: DM, PM, private chat
+
+**Sacrifice**:
+The living player claimed by the Entity to end a round—by timer expiry, Sudden Death tiebreak, 100% Doom spike, or disconnect—who then becomes a Ghost.
+_Avoid_: Kill, death, elimination
 
 **Ghost**:
 An eliminated player who can no longer plead for survival and instead casts Curses on living players.

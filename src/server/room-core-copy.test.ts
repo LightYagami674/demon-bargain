@@ -112,9 +112,7 @@ class CopyTestHarness {
   }
 
   async flushMicrotasks(): Promise<void> {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await this.room.flushPendingEvaluations();
   }
 
   announcementsFor(connId: string) {
@@ -128,7 +126,7 @@ class CopyTestHarness {
 const ALL_MOOD_HINTS = new Set(Object.values(MOOD_HINT_POOLS).flat());
 
 describe("RoomCore curated script bank integration", () => {
-  it("emits verbatim ROUND_INTRO_FIRST, MOOD_HINT, MOOD_SHIFT, ROUND_RESOLVING, SACRIFICE_TIMER, ROUND_INTRO_NEXT, and POST_MATCH_SURVIVOR", async () => {
+  it("emits verbatim ROUND_INTRO_FIRST, MOOD_HINT, ROUND_RESOLVING, SACRIFICE_TIMER, ROUND_INTRO_NEXT, and POST_MATCH_SURVIVOR without mid-round MOOD_SHIFT", async () => {
     const h = new CopyTestHarness();
     h.connectAndJoin("c1", "Alice");
     h.connectAndJoin("c2", "Bob");
@@ -142,14 +140,11 @@ describe("RoomCore curated script bank integration", () => {
     expect(anns[1]?.beatType).toBe("MOOD_HINT");
     expect(ALL_MOOD_HINTS.has(anns[1]?.text ?? "")).toBe(true);
 
-    // Enter ROUND_ACTIVE (3.5s), then advance 30s for MOOD_SHIFT
+    // Enter ROUND_ACTIVE (3.5s) and advance 60s mid-round -> NO MOOD_SHIFT emitted
     h.advanceTime(3_500);
-    h.advanceTime(30_000);
+    h.advanceTime(60_000);
     anns = h.announcementsFor("c1");
-    const moodShift = anns.find((a) => a.beatType === "MOOD_SHIFT");
-    expect(moodShift).toBeDefined();
-    expect(ALL_MOOD_HINTS.has(moodShift!.text)).toBe(true);
-    expect(moodShift!.text).not.toBe(anns[1]!.text);
+    expect(anns.some((a) => a.beatType === "MOOD_SHIFT")).toBe(false);
 
     // Give Bob higher doom so timer sacrifice triggers cleanly without tie
     h.jev.handler = async (input) => ({
@@ -162,8 +157,8 @@ describe("RoomCore curated script bank integration", () => {
     h.send("c2", { type: "send_chat", text: "Please spare me I beg you." });
     await h.flushMicrotasks();
 
-    // Expire ROUND_ACTIVE (65s total for 3p, 30s already elapsed -> 35s left)
-    h.advanceTime(35_000);
+    // Expire ROUND_ACTIVE (120s total, 60s already elapsed -> 60s left)
+    h.advanceTime(60_000);
     anns = h.announcementsFor("c1");
     const resolving = anns.find((a) => a.beatType === "ROUND_RESOLVING");
     expect(resolving).toBeDefined();
@@ -187,6 +182,10 @@ describe("RoomCore curated script bank integration", () => {
     const round2Intro = anns.filter((a) => a.beatType === "ROUND_INTRO")[1];
     expect(round2Intro).toBeDefined();
     expect(BEAT_POOLS.ROUND_INTRO_NEXT).toContain(round2Intro!.text);
+    const round2Hint = anns.filter((a) => a.beatType === "MOOD_HINT")[1];
+    expect(round2Hint).toBeDefined();
+    expect(ALL_MOOD_HINTS.has(round2Hint!.text)).toBe(true);
+    expect(round2Hint!.text).not.toBe(anns[1]!.text);
 
     // Round 2: Carol hits 100% mid-round spike -> SACRIFICE_SPIKE + POST_MATCH_SURVIVOR
     h.advanceTime(3_500);
@@ -270,8 +269,8 @@ describe("RoomCore curated script bank integration", () => {
     h.send("c3", { type: "send_chat", text: "It is all my fault." });
     await h.flushMicrotasks();
 
-    // Advance to end of Round 1 (65s - 45s = 20s) + ROUND_RESOLVING (2s) -> SUDDEN_DEATH
-    h.advanceTime(20_000);
+    // Advance to end of Round 1 (120s - 45s = 75s) + ROUND_RESOLVING (2s) -> SUDDEN_DEATH
+    h.advanceTime(75_000);
     h.advanceTime(2_000);
     const sd = h.announcementsFor("c1").find((a) => a.beatType === "SUDDEN_DEATH");
     expect(sd).toBeDefined();
@@ -307,10 +306,11 @@ describe("RoomCore curated script bank integration", () => {
     expect(curseLine).not.toMatch(/\{[a-zA-Z0-9_]+\}/);
   });
 
-  it("persists shuffle-bag state across RoomCore hibernation so Mood hints do not repeat", () => {
+  it("persists shuffle-bag state across RoomCore hibernation so Mood hints do not repeat", async () => {
     const h = new CopyTestHarness(() => 0.42);
     h.connectAndJoin("c1", "Alice");
     h.connectAndJoin("c2", "Bob");
+    h.connectAndJoin("c3", "Carol");
     h.send("c1", { type: "start_match" });
 
     const firstHint = h
@@ -318,15 +318,29 @@ describe("RoomCore curated script bank integration", () => {
       .find((a) => a.beatType === "MOOD_HINT")?.text;
     expect(firstHint).toBeDefined();
 
+    // Give Carol highest doom in Round 1 so Round 2 starts cleanly
+    h.advanceTime(3_500);
+    h.jev.handler = async (input) => ({
+      roundId: input.roundId,
+      persuasivenessScore: 0.0,
+      targetBlamed: "NONE",
+      targetBlamedConfidence: 0.9,
+      isLowEffortSpamNoul: 0.1,
+    });
+    h.send("c3", { type: "send_chat", text: "Please spare me I beg you." });
+    await h.flushMicrotasks();
+
     // Simulate DO hibernation by constructing a fresh RoomCore from persisted KV
     h.room = h.makeRoom(() => 0.42);
-    h.advanceTime(3_500);
-    h.advanceTime(30_000);
+    h.advanceTime(120_000); // ROUND_ACTIVE -> ROUND_RESOLVING
+    h.advanceTime(2_000); // -> SACRIFICE_REVEAL
+    h.advanceTime(4_500); // -> Round 2 ROUND_INTRO + MOOD_HINT
 
-    const shiftHint = h
+    const round2Hint = h
       .announcementsFor("c1")
-      .find((a) => a.beatType === "MOOD_SHIFT")?.text;
-    expect(shiftHint).toBeDefined();
-    expect(shiftHint).not.toBe(firstHint);
+      .filter((a) => a.beatType === "MOOD_HINT")[1]?.text;
+    expect(round2Hint).toBeDefined();
+    expect(ALL_MOOD_HINTS.has(round2Hint!)).toBe(true);
+    expect(round2Hint).not.toBe(firstHint);
   });
 });

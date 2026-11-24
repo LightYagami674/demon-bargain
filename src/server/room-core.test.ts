@@ -461,7 +461,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     });
   });
 
-  it("runs a 2-player Match with 60s ROUND_ACTIVE, eliminates highest-Doom player into Ghost, and ends in POST_MATCH", () => {
+  it("runs a 2-player Match with 120s ROUND_ACTIVE, eliminates highest-Doom player into Ghost, and ends in POST_MATCH", () => {
     const h = new FakeRoomHarness();
     h.send("c1", { type: "join", name: "Alice" });
     h.send("c2", { type: "join", name: "Bob" });
@@ -471,7 +471,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     h.send("c1", { type: "start_match" });
     h.clearMessages();
 
-    // Advance past ROUND_INTRO (3500ms) -> ROUND_ACTIVE (60_000ms for 2p)
+    // Advance past ROUND_INTRO (3500ms) -> ROUND_ACTIVE (120_000ms)
     h.advanceTime(3500);
     expect(h.lastMessageFor("c1")).toMatchObject({
       type: "phase_changed",
@@ -479,15 +479,15 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
       matchPhase: "ROUND_ACTIVE",
       round: 1,
       serverNow: h.now,
-      phaseEndsAt: h.now + 60_000,
+      phaseEndsAt: h.now + 120_000,
     });
 
     // Give Bob higher Doom so Bob is claimed at round end
     h.room.setPlayerDoomForMatch(snap2.selfPlayerId, 78);
 
-    // Advance 60_000ms -> ROUND_RESOLVING (2000ms)
+    // Advance 120_000ms -> ROUND_RESOLVING (2000ms)
     h.clearMessages();
-    h.advanceTime(60_000);
+    h.advanceTime(120_000);
     expect(
       h.messagesFor("c1").find((m) => m.type === "phase_changed"),
     ).toMatchObject({
@@ -532,7 +532,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     });
   });
 
-  it("follows the 6->90s, 5->75s, 4->65s, 3->55s, 2->45s duration curve and soft-resets Doom between rounds", () => {
+  it("uses fixed 120s round duration across all rounds of a 6-player Match and soft-resets Doom between rounds", () => {
     const h = new FakeRoomHarness();
     const ids: string[] = [];
     for (let i = 1; i <= 6; i++) {
@@ -545,9 +545,9 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
 
     h.send("c1", { type: "start_match" });
 
-    const expectedDurations = [90_000, 75_000, 65_000, 55_000, 45_000];
-    for (let r = 0; r < expectedDurations.length; r++) {
-      const expectedMs = expectedDurations[r]!;
+    const totalRounds = 5;
+    const expectedMs = 120_000;
+    for (let r = 0; r < totalRounds; r++) {
       h.clearMessages();
       h.advanceTime(3500); // ROUND_INTRO -> ROUND_ACTIVE
       const activeMsg = h.lastMessageFor("c1");
@@ -579,7 +579,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
         const p1 = nextPhase.players.find((p) => p.id === ids[0]);
         expect(p1?.doom).toBe(66);
       }
-      if (r === expectedDurations.length - 1) {
+      if (r === totalRounds - 1) {
         expect(nextPhase.phase).toBe("POST_MATCH");
         expect(nextPhase.winnerId).toBe(ids[0]);
       } else {
@@ -621,18 +621,20 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
       code: "INVALID_PAYLOAD",
     });
 
-    // Valid chat broadcasts immediately to all players
+    // Valid chat broadcasts immediately to all players (pendingJudge: false without Jev evaluator)
     h.clearMessages();
     h.send("c1", { type: "send_chat", text: "I am innocent!" });
     expect(h.lastMessageFor("c1")).toMatchObject({
       type: "chat_message",
       playerName: "Alice",
       text: "I am innocent!",
+      pendingJudge: false,
     });
     expect(h.lastMessageFor("c2")).toMatchObject({
       type: "chat_message",
       playerName: "Alice",
       text: "I am innocent!",
+      pendingJudge: false,
     });
 
     // 2.5s cooldown enforced for Alice, but Bob can speak immediately
@@ -662,7 +664,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
 
     // Eliminate Carol -> Round 2 -> Ghosts cannot send public chat
     h.room.setPlayerDoomForMatch(snap3.selfPlayerId, 99);
-    h.advanceTime(65_000 - 2500); // finish ROUND_ACTIVE
+    h.advanceTime(120_000 - 2500); // finish ROUND_ACTIVE
     h.advanceTime(2000); // ROUND_RESOLVING -> SACRIFICE_REVEAL
     h.advanceTime(4500); // -> Round 2 ROUND_INTRO
     h.advanceTime(3500); // -> Round 2 ROUND_ACTIVE
@@ -758,10 +760,10 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
 
     // Eliminate Carol in Round 1 -> Ghost
     h.room.setPlayerDoomForMatch(snap3.selfPlayerId, 95);
-    h.advanceTime(65_000); // ROUND_RESOLVING
+    h.advanceTime(120_000); // ROUND_RESOLVING
     h.advanceTime(2_000); // SACRIFICE_REVEAL
     h.advanceTime(4_500); // Round 2 ROUND_INTRO
-    h.advanceTime(3_500); // Round 2 ROUND_ACTIVE (75s? no, 2 living -> 45s)
+    h.advanceTime(3_500); // Round 2 ROUND_ACTIVE (120s)
 
     // Ghost Carol disconnects for 60s (longer than 45s living grace)
     h.disconnect("c3");
@@ -863,7 +865,7 @@ describe("Room WebSocket seam — Match loop, timers, Doom soft-reset & live pub
     h.send("c1", { type: "start_match" });
     h.advanceTime(3500);
     h.room.setPlayerDoomForMatch(snap3.selfPlayerId, 95);
-    h.advanceTime(65_000);
+    h.advanceTime(120_000);
     h.advanceTime(2_000);
     h.advanceTime(4_500);
     h.advanceTime(3_500); // Round 2 ROUND_ACTIVE with Alice & Bob alive
