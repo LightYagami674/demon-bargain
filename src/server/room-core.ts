@@ -13,7 +13,6 @@ import {
   MIN_PLAYERS,
   MIN_PLAYERS_FOR_WHISPERS,
   MIN_WHISPER_LENGTH,
-  MOOD_ROTATION_MS,
   PRESET_AVATARS,
   RECENT_CONTEXT_LIMIT,
   ROOM_EMPTY_CLEANUP_MS,
@@ -152,7 +151,6 @@ interface PersistedRoomState {
   activeCurses?: ActiveCurse[];
   entityMood?: EntityMood;
   previousRoundMood?: EntityMood | null;
-  nextMoodRotationAt?: number | null;
   copyState?: SerializedCopyEngineState;
   roundId?: string;
   isSuddenDeath?: boolean;
@@ -195,7 +193,6 @@ export class RoomCore {
   private activeCurses: ActiveCurse[] = [];
   private entityMood: EntityMood = "SADIST";
   private previousRoundMood: EntityMood | null = null;
-  private nextMoodRotationAt: number | null = null;
   private copyEngine: EntityCopyEngine;
   private roundId = "";
   private isSuddenDeath = false;
@@ -257,7 +254,6 @@ export class RoomCore {
         this.activeCurses = parsed.activeCurses ?? [];
         this.entityMood = parsed.entityMood ?? "SADIST";
         this.previousRoundMood = parsed.previousRoundMood ?? null;
-        this.nextMoodRotationAt = parsed.nextMoodRotationAt ?? null;
         if (parsed.copyState) {
           this.copyEngine.restore(parsed.copyState);
         }
@@ -520,21 +516,6 @@ export class RoomCore {
         this.phase === "IN_MATCH" &&
         this.matchPhase === "ROUND_ACTIVE"
       ) {
-        if (
-          !this.isSuddenDeath &&
-          this.nextMoodRotationAt !== null &&
-          now >= this.nextMoodRotationAt
-        ) {
-          this.entityMood = pickNextMood(this.entityMood, this.random);
-          const hint = this.copyEngine.drawMoodHint(this.entityMood);
-          this.nextMoodRotationAt =
-            this.phaseEndsAt !== null && now + MOOD_ROTATION_MS < this.phaseEndsAt
-              ? now + MOOD_ROTATION_MS
-              : null;
-          this.persist();
-          this.emitEntityAnnouncement("MOOD_SHIFT", hint, now);
-        }
-
         let interceptedInFallback = false;
         if (
           !this.whisperFallbackTriggered &&
@@ -572,10 +553,6 @@ export class RoomCore {
       );
       this.matchPhase = "ROUND_ACTIVE";
       this.phaseEndsAt = now + durationMs;
-      this.nextMoodRotationAt =
-        !this.isSuddenDeath && MOOD_ROTATION_MS < durationMs
-          ? now + MOOD_ROTATION_MS
-          : null;
       this.roundWhispers = [];
       this.lastWhisperInterceptAt = null;
       this.roundWhisperInterceptCount = 0;
@@ -591,7 +568,6 @@ export class RoomCore {
 
     if (this.matchPhase === "ROUND_ACTIVE") {
       this.matchPhase = "ROUND_RESOLVING";
-      this.nextMoodRotationAt = null;
       this.whisperFallbackAt = null;
       this.activeCurses = [];
       const resolvingMs =
@@ -642,7 +618,6 @@ export class RoomCore {
       this.isSuddenDeath = false;
       this.roundId = this.generateId();
       this.roundPublicMessages = [];
-      this.nextMoodRotationAt = null;
       this.resolvingCapAt = null;
       this.entityMood = pickNextMood(this.previousRoundMood, this.random);
       this.previousRoundMood = this.entityMood;
@@ -903,7 +878,6 @@ export class RoomCore {
     this.whisperFallbackTriggered = false;
     this.whisperFallbackAt = null;
     this.lastSpamMockeryAt = null;
-    this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.lastLeakedWhisper = null;
     this.entityMood = pickNextMood(null, this.random);
@@ -1130,6 +1104,7 @@ export class RoomCore {
       avatarId: player.avatarId,
       text,
       timestamp: now,
+      pendingJudge: Boolean(this.jevEvaluator),
     };
     this.transport.broadcast(JSON.stringify(payload));
 
@@ -1680,7 +1655,6 @@ export class RoomCore {
     }
     this.sacrificedPlayerId = victim.id;
     this.isSuddenDeath = false;
-    this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.activeCurses = [];
     this.roundId = this.generateId();
@@ -1719,7 +1693,6 @@ export class RoomCore {
       SUDDEN_DEATH_DURATION_MS > WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
         ? now + SUDDEN_DEATH_DURATION_MS - WHISPER_INTERCEPT_FALLBACK_REMAINING_MS
         : null;
-    this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.entityMood = pickNextMood(this.entityMood, this.random);
     this.previousRoundMood = this.entityMood;
@@ -1757,7 +1730,6 @@ export class RoomCore {
     this.phase = "POST_MATCH";
     this.matchPhase = null;
     this.phaseEndsAt = null;
-    this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.isSuddenDeath = false;
     this.sacrificedPlayerId = null;
@@ -1868,7 +1840,6 @@ export class RoomCore {
     this.whisperFallbackTriggered = false;
     this.whisperFallbackAt = null;
     this.lastSpamMockeryAt = null;
-    this.nextMoodRotationAt = null;
     this.resolvingCapAt = null;
     this.lastLeakedWhisper = null;
     this.lastActivityAt = now;
@@ -2307,9 +2278,6 @@ export class RoomCore {
     if (this.phase === "IN_MATCH") {
       consider(this.phaseEndsAt);
       if (this.matchPhase === "ROUND_ACTIVE") {
-        if (!this.isSuddenDeath && this.nextMoodRotationAt !== null) {
-          consider(this.nextMoodRotationAt);
-        }
         if (
           !this.whisperFallbackTriggered &&
           this.roundWhisperInterceptCount === 0 &&
@@ -2359,7 +2327,6 @@ export class RoomCore {
       activeCurses: this.activeCurses,
       entityMood: this.entityMood,
       previousRoundMood: this.previousRoundMood,
-      nextMoodRotationAt: this.nextMoodRotationAt,
       copyState: this.copyEngine.serialize(),
       roundId: this.roundId,
       isSuddenDeath: this.isSuddenDeath,

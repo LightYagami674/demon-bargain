@@ -1,9 +1,21 @@
 import type { FeedItem } from "../shared/protocol";
 
+export interface MessageVerdict {
+  delta: number;
+  doom: number;
+  blamedDeltas?: Array<{
+    playerId: string;
+    playerName: string;
+    delta: number;
+  }>;
+}
+
 export interface FeedCardProps {
   item: FeedItem;
   selfPlayerId?: string;
   compact?: boolean;
+  judgePending?: boolean;
+  verdict?: MessageVerdict;
 }
 
 /** Shared feed item card used by the live Match HUD and Post-Match log drawer. */
@@ -11,6 +23,8 @@ export function FeedCard({
   item,
   selfPlayerId,
   compact = false,
+  judgePending = false,
+  verdict,
 }: FeedCardProps) {
   if (item.kind === "entity") {
     return (
@@ -94,6 +108,48 @@ export function FeedCard({
         {item.playerName}
       </p>
       <p className="break-words">{item.text}</p>
+      {isMine && judgePending && (
+        <div
+          data-testid={`msg-judge-pending-${item.id}`}
+          className="mt-1.5 flex items-center gap-1.5 text-[10.5px] font-semibold text-amber-300/90"
+        >
+          <span
+            aria-hidden="true"
+            className="inline-block h-2.5 w-2.5 rounded-full border-[1.5px] border-amber-300/35 border-t-amber-300 animate-spin"
+          />
+          <span>Weighing plea...</span>
+        </div>
+      )}
+      {isMine && !judgePending && verdict && (
+        <div
+          data-testid={`msg-judge-verdict-${item.id}`}
+          className="mt-1.5 flex flex-wrap items-center gap-1"
+        >
+          <span
+            className={`inline-flex items-center rounded-full border px-1.5 py-0.5 font-mono text-[10px] font-bold leading-none ${
+              verdict.delta > 0
+                ? "border-rose-500/60 bg-rose-950/70 text-rose-200"
+                : verdict.delta < 0
+                  ? "border-emerald-500/60 bg-emerald-950/70 text-emerald-200"
+                  : "border-zinc-600/70 bg-zinc-800/80 text-zinc-300"
+            }`}
+          >
+            {verdict.delta > 0
+              ? `▲ +${verdict.delta}% Doom`
+              : verdict.delta < 0
+                ? `▼ ${verdict.delta}% Doom`
+                : "✓ 0% Doom"}
+          </span>
+          {verdict.blamedDeltas?.map((b) => (
+            <span
+              key={b.playerId}
+              className="inline-flex items-center rounded-full border border-purple-500/50 bg-purple-950/60 px-1.5 py-0.5 font-mono text-[10px] font-semibold leading-none text-purple-200"
+            >
+              {b.playerName} {b.delta > 0 ? `+${b.delta}%` : `${b.delta}%`}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -187,32 +187,65 @@ function setup3PlayerMatch(h: FakeJevRoomHarness): string[] {
 }
 
 describe("RoomCore Jev, Entity Moods, Doom math & tiebreakers (#18)", () => {
-  it("rotates across Entity Moods every 30s during ROUND_ACTIVE without repeats and never leaks entityMood in ServerMessage", async () => {
-    // 3 players -> ROUND_ACTIVE is 55_000ms (so 1 rotation at 30_000ms)
+  it("keeps Entity Mood fixed throughout ROUND_ACTIVE, picks a fresh Mood next round, sets pendingJudge, and never leaks entityMood", async () => {
     const h = new FakeJevRoomHarness([0.0, 0.0, 0.2, 0.4, 0.6, 0.8]);
-    setup3PlayerMatch(h);
-    h.advanceTime(3500); // -> ROUND_ACTIVE (55s)
+    const [, , carolId] = setup3PlayerMatch(h);
+    h.advanceTime(3500); // -> ROUND_ACTIVE (120s)
 
     h.send("c1", { type: "send_chat", text: "Please spare me, I beg you." });
+    expect(
+      h.messagesFor("c1").find((m) => m.type === "chat_message"),
+    ).toMatchObject({
+      type: "chat_message",
+      pendingJudge: true,
+    });
     await h.flushJev();
 
     const mood1 = h.jev.judgeCalls[0]?.entityMood;
     expect(ENTITY_MOODS).toContain(mood1);
     expect(h.jev.judgeCalls[0]?.moodRubric.length).toBeGreaterThan(10);
 
-    // Advance 30s -> should rotate to a strictly different Mood and emit MOOD_SHIFT hint
-    h.clearMessages();
-    h.advanceTime(30_000);
+    // Check at 30s, 60s, 90s, and 115s -> mood stays fixed and zero MOOD_SHIFT emitted
+    for (const [stepMs, speaker] of [
+      [30_000, "c2"],
+      [30_000, "c1"],
+      [30_000, "c2"],
+      [25_000, "c1"],
+    ] as const) {
+      h.advanceTime(stepMs);
+      h.send(speaker, { type: "send_chat", text: `Plea at ${h.now}` });
+      await h.flushJev();
+      expect(
+        h.jev.judgeCalls[h.jev.judgeCalls.length - 1]?.entityMood,
+      ).toBe(mood1);
+    }
 
-    const announcements = h
+    const round1Announcements = h
       .messagesFor("c1")
       .filter((m) => m.type === "entity_announcement");
-    expect(announcements.some((a) => a.beatType === "MOOD_SHIFT")).toBe(true);
+    expect(
+      round1Announcements.some((a) => a.beatType === "MOOD_SHIFT"),
+    ).toBe(false);
 
+    // Eliminate Carol at Round 1 end -> Round 2 picks a strictly different Mood and emits MOOD_HINT
+    h.room.setPlayerDoomForMatch(carolId!, 95);
+    h.clearMessages();
+    h.advanceTime(5_000); // finish 120s ROUND_ACTIVE -> ROUND_RESOLVING
+    h.advanceTime(2_000); // -> SACRIFICE_REVEAL
+    h.advanceTime(4_500); // -> Round 2 ROUND_INTRO
+
+    const round2Announcements = h
+      .messagesFor("c1")
+      .filter((m) => m.type === "entity_announcement");
+    expect(
+      round2Announcements.some((a) => a.beatType === "MOOD_HINT"),
+    ).toBe(true);
+
+    h.advanceTime(3_500); // -> Round 2 ROUND_ACTIVE
     h.send("c2", { type: "send_chat", text: "Alice is lying to you!" });
     await h.flushJev();
 
-    const mood2 = h.jev.judgeCalls[1]?.entityMood;
+    const mood2 = h.jev.judgeCalls[h.jev.judgeCalls.length - 1]?.entityMood;
     expect(ENTITY_MOODS).toContain(mood2);
     expect(mood2).not.toBe(mood1);
 
@@ -341,7 +374,7 @@ describe("RoomCore Jev, Entity Moods, Doom math & tiebreakers (#18)", () => {
 
     // Eliminate Carol -> Round 2 -> verify Ghost Carol is excluded from livingPlayers
     h.room.setPlayerDoomForMatch(carolId!, 99);
-    h.advanceTime(55_000 - 11_500); // finish ROUND_ACTIVE
+    h.advanceTime(120_000 - 11_500); // finish ROUND_ACTIVE
     h.advanceTime(3_000); // ROUND_RESOLVING -> SACRIFICE_REVEAL
     h.advanceTime(4_500); // -> Round 2 ROUND_INTRO
     h.advanceTime(3_500); // -> Round 2 ROUND_ACTIVE
@@ -426,14 +459,14 @@ describe("RoomCore Jev, Entity Moods, Doom math & tiebreakers (#18)", () => {
 
     // Advance to Round 2 -> test ROUND_RESOLVING 3s cap discarding late verdict
     h.advanceTime(4500); // -> Round 2 ROUND_INTRO
-    h.advanceTime(3500); // -> Round 2 ROUND_ACTIVE (45s for 2p remaining of 3p)
+    h.advanceTime(3500); // -> Round 2 ROUND_ACTIVE (120s)
 
     const lateDeferred = createDeferred<JudgeMessageResult>();
     h.jev.onJudge(async () => lateDeferred.promise);
     h.send("c1", { type: "send_chat", text: "Late plea in round 2" });
 
     // Expire ROUND_ACTIVE -> enters ROUND_RESOLVING with 3s cap
-    h.advanceTime(45_000);
+    h.advanceTime(120_000);
     // Advance 3_000ms -> SACRIFICE_REVEAL (past 3s cap)
     h.advanceTime(3_000);
     // Even if we check a verdict tagged with stale roundId or past 3s cap, it's discarded
@@ -466,7 +499,7 @@ describe("RoomCore Jev, Entity Moods, Doom math & tiebreakers (#18)", () => {
     h.room.setPlayerDoomForMatch(bobId!, 60);
     h.room.setPlayerDoomForMatch(carolId!, 60);
 
-    h.advanceTime(54_000); // -> ROUND_RESOLVING
+    h.advanceTime(119_000); // -> ROUND_RESOLVING
     h.clearMessages();
     h.advanceTime(2_000); // -> Sudden Death ROUND_ACTIVE (30s)
 

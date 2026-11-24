@@ -22,8 +22,22 @@ import {
   type RoomPhase,
   type ServerMessage,
 } from "../shared/protocol.js";
-import { MatchHud } from "./MatchHud.js";
+import {
+  EMPTY_JUDGE_FEEDBACK,
+  MatchHud,
+  type JudgeFeedbackState,
+  type PlayerDoomFlash,
+  type SelfVerdictNotice,
+} from "./MatchHud.js";
+import type { MessageVerdict } from "./FeedCard.js";
 import { PostMatchView } from "./PostMatchView.js";
+
+export {
+  EMPTY_JUDGE_FEEDBACK,
+  type JudgeFeedbackState,
+  type PlayerDoomFlash,
+  type SelfVerdictNotice,
+};
 import {
   createPartyRoomSocket,
   type CreateRoomSocket,
@@ -74,6 +88,7 @@ interface RoomSnapshotState {
   whisperCooldownEndsAt: number | null;
   activeCurses: ActiveCurse[];
   curseCooldownEndsAt: number | null;
+  judgeFeedback: JudgeFeedbackState;
 }
 
 export function App({ createSocket = createPartyRoomSocket }: AppProps) {
@@ -303,10 +318,11 @@ function RoomView({
   const onExitRef = useRef(onExit);
   onExitRef.current = onExit;
 
-  const sendMessage = (msg: ClientMessage) => {
+  const sendMessage = (msg: ClientMessage): boolean => {
     const sock = socketRef.current;
-    if (!sock || sock.readyState !== 1) return;
+    if (!sock || sock.readyState !== 1) return false;
     sock.send(JSON.stringify(msg));
+    return true;
   };
 
   useEffect(() => {
@@ -387,6 +403,7 @@ function RoomView({
             whisperCooldownEndsAt: msg.whisperCooldownEndsAt ?? null,
             activeCurses: msg.activeCurses ?? [],
             curseCooldownEndsAt: msg.curseCooldownEndsAt ?? null,
+            judgeFeedback: EMPTY_JUDGE_FEEDBACK,
           });
           break;
         }
@@ -397,7 +414,19 @@ function RoomView({
             if (me) {
               setPreferredAvatar(me.avatarId);
             }
-            return { ...prev, players: msg.players };
+            const nextJudgeFeedback =
+              me && !me.alive
+                ? {
+                    ...prev.judgeFeedback,
+                    pendingEchoTimestamps: [],
+                    pendingMessageIds: {},
+                  }
+                : prev.judgeFeedback;
+            return {
+              ...prev,
+              players: msg.players,
+              judgeFeedback: nextJudgeFeedback,
+            };
           });
           break;
         }
@@ -411,6 +440,29 @@ function RoomView({
                 : msg.phase === "POST_MATCH"
                   ? prev.feed.filter((item) => item.kind !== "whisper")
                   : prev.feed;
+            let nextJudgeFeedback: JudgeFeedbackState;
+            if (msg.phase === "WAITING") {
+              nextJudgeFeedback = EMPTY_JUDGE_FEEDBACK;
+            } else if (msg.matchPhase === "ROUND_RESOLVING") {
+              nextJudgeFeedback = {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps: [],
+              };
+            } else if (msg.matchPhase === "SACRIFICE_REVEAL") {
+              nextJudgeFeedback = {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps: [],
+                pendingMessageIds: {},
+              };
+            } else {
+              nextJudgeFeedback = {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps: [],
+                pendingMessageIds: {},
+                lastSelfVerdict: null,
+                playerDoomFlashes: {},
+              };
+            }
             return {
               ...prev,
               phase: msg.phase,
@@ -435,6 +487,7 @@ function RoomView({
                 msg.phase === "WAITING" || msg.matchPhase === "ROUND_INTRO"
                   ? null
                   : prev.curseCooldownEndsAt,
+              judgeFeedback: nextJudgeFeedback,
             };
           });
           break;
@@ -459,6 +512,13 @@ function RoomView({
               feed: prev.feed.filter((item) => item.kind !== "whisper"),
               activeCurses: [],
               curseCooldownEndsAt: null,
+              judgeFeedback: {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps: [],
+                pendingMessageIds: {},
+                lastSelfVerdict: null,
+                playerDoomFlashes: {},
+              },
             };
           });
           break;
@@ -476,7 +536,27 @@ function RoomView({
               timestamp: msg.timestamp,
             };
             const nextFeed = [...prev.feed, item].slice(-MAX_FEED_ITEMS);
-            return { ...prev, feed: nextFeed };
+            let nextJudgeFeedback = prev.judgeFeedback;
+            if (msg.playerId === prev.selfPlayerId) {
+              const nextEchoes =
+                prev.judgeFeedback.pendingEchoTimestamps.slice(1);
+              const shouldTrackPending =
+                msg.pendingJudge !== false &&
+                prev.phase === "IN_MATCH" &&
+                prev.matchPhase === "ROUND_ACTIVE";
+              const nextPendingIds = shouldTrackPending
+                ? {
+                    ...prev.judgeFeedback.pendingMessageIds,
+                    [msg.id]: Date.now(),
+                  }
+                : prev.judgeFeedback.pendingMessageIds;
+              nextJudgeFeedback = {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps: nextEchoes,
+                pendingMessageIds: nextPendingIds,
+              };
+            }
+            return { ...prev, feed: nextFeed, judgeFeedback: nextJudgeFeedback };
           });
           break;
         }
@@ -537,12 +617,108 @@ function RoomView({
         case "doom_updated": {
           setSnapshot((prev) => {
             if (!prev) return prev;
+            const now = Date.now();
             const byId = new Map(msg.updates.map((u) => [u.playerId, u]));
             const nextPlayers = prev.players.map((p) => {
               const upd = byId.get(p.id);
               return upd ? { ...p, doom: upd.doom } : p;
             });
-            return { ...prev, players: nextPlayers };
+
+            let nextSeq = 0;
+            for (const flash of Object.values(
+              prev.judgeFeedback.playerDoomFlashes,
+            )) {
+              if (flash.seq > nextSeq) {
+                nextSeq = flash.seq;
+              }
+            }
+            const nextFlashes = { ...prev.judgeFeedback.playerDoomFlashes };
+            for (const u of msg.updates) {
+              nextSeq += 1;
+              nextFlashes[u.playerId] = {
+                delta: u.delta,
+                doom: u.doom,
+                updatedAt: now,
+                seq: nextSeq,
+              };
+            }
+
+            const selfUpdate = byId.get(prev.selfPlayerId);
+            let resolvedId: string | null = null;
+            if (msg.sourceMessageId) {
+              const matchesPending =
+                msg.sourceMessageId in prev.judgeFeedback.pendingMessageIds;
+              const matchesSelfChat = prev.feed.some(
+                (item) =>
+                  item.kind === "chat" &&
+                  item.id === msg.sourceMessageId &&
+                  item.playerId === prev.selfPlayerId,
+              );
+              if (matchesPending || matchesSelfChat) {
+                resolvedId = msg.sourceMessageId;
+              }
+            } else if (selfUpdate) {
+              let oldestId: string | null = null;
+              let oldestTs = Infinity;
+              for (const [id, ts] of Object.entries(
+                prev.judgeFeedback.pendingMessageIds,
+              )) {
+                if (ts < oldestTs) {
+                  oldestTs = ts;
+                  oldestId = id;
+                }
+              }
+              resolvedId = oldestId;
+            }
+
+            let nextPendingIds = prev.judgeFeedback.pendingMessageIds;
+            let nextVerdicts = prev.judgeFeedback.messageVerdicts;
+            let nextLastSelfVerdict = prev.judgeFeedback.lastSelfVerdict;
+
+            if (resolvedId && selfUpdate) {
+              if (resolvedId in nextPendingIds) {
+                const copy = { ...nextPendingIds };
+                delete copy[resolvedId];
+                nextPendingIds = copy;
+              }
+              const blamedDeltas = msg.updates
+                .filter((u) => u.playerId !== prev.selfPlayerId && u.delta !== 0)
+                .map((u) => {
+                  const target = prev.players.find((p) => p.id === u.playerId);
+                  return {
+                    playerId: u.playerId,
+                    playerName: target?.name ?? "Rival",
+                    delta: u.delta,
+                  };
+                });
+              const verdict: MessageVerdict = {
+                delta: selfUpdate.delta,
+                doom: selfUpdate.doom,
+                ...(blamedDeltas.length > 0 ? { blamedDeltas } : {}),
+              };
+              nextVerdicts = {
+                ...prev.judgeFeedback.messageVerdicts,
+                [resolvedId]: verdict,
+              };
+              nextLastSelfVerdict = {
+                messageId: resolvedId,
+                delta: selfUpdate.delta,
+                doom: selfUpdate.doom,
+                resolvedAt: now,
+              };
+            }
+
+            return {
+              ...prev,
+              players: nextPlayers,
+              judgeFeedback: {
+                ...prev.judgeFeedback,
+                pendingMessageIds: nextPendingIds,
+                messageVerdicts: nextVerdicts,
+                lastSelfVerdict: nextLastSelfVerdict,
+                playerDoomFlashes: nextFlashes,
+              },
+            };
           });
           break;
         }
@@ -580,6 +756,19 @@ function RoomView({
         }
         case "error": {
           setErrorBanner({ code: msg.code, message: msg.message });
+          setSnapshot((prev) => {
+            if (!prev || prev.judgeFeedback.pendingEchoTimestamps.length === 0) {
+              return prev;
+            }
+            return {
+              ...prev,
+              judgeFeedback: {
+                ...prev.judgeFeedback,
+                pendingEchoTimestamps:
+                  prev.judgeFeedback.pendingEchoTimestamps.slice(1),
+              },
+            };
+          });
           break;
         }
       }
@@ -587,6 +776,18 @@ function RoomView({
 
     const handleClose = () => {
       setSocketOpen(false);
+      setSnapshot((prev) => {
+        if (!prev || prev.judgeFeedback.pendingEchoTimestamps.length === 0) {
+          return prev;
+        }
+        return {
+          ...prev,
+          judgeFeedback: {
+            ...prev.judgeFeedback,
+            pendingEchoTimestamps: [],
+          },
+        };
+      });
     };
 
     const handleVisibilityOrOnline = (event: Event) => {
@@ -777,10 +978,28 @@ function RoomView({
         serverWhisperCooldownEndsAt={snapshot.whisperCooldownEndsAt}
         activeCurses={snapshot.activeCurses}
         curseCooldownEndsAt={snapshot.curseCooldownEndsAt}
+        judgeFeedback={snapshot.judgeFeedback}
         reconnecting={!socketOpen}
         errorBanner={errorBanner}
         onDismissError={() => setErrorBanner(null)}
-        onSendChat={(text) => sendMessage({ type: "send_chat", text })}
+        onSendChat={(text) => {
+          if (sendMessage({ type: "send_chat", text })) {
+            const sentAt = Date.now();
+            setSnapshot((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                judgeFeedback: {
+                  ...prev.judgeFeedback,
+                  pendingEchoTimestamps: [
+                    ...prev.judgeFeedback.pendingEchoTimestamps,
+                    sentAt,
+                  ],
+                },
+              };
+            });
+          }
+        }}
         onSendWhisper={(targetPlayerId, text) =>
           sendMessage({ type: "send_whisper", targetPlayerId, text })
         }

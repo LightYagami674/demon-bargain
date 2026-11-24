@@ -1908,3 +1908,534 @@ describe("SPA Socket Seam — POST_MATCH summary, conditional awards, Match log 
     expect(screen.queryByText(/Secret whisper/i)).not.toBeInTheDocument();
   });
 });
+
+describe("SPA Socket Seam — Input processing & Doom-update feedback (#27)", () => {
+  let sockets: FakeRoomSocket[];
+  let createSocket: CreateRoomSocket;
+
+  beforeEach(() => {
+    cleanup();
+    window.localStorage.clear();
+    setRoomToken("FEED", "tok-alice");
+    window.history.replaceState({}, "", "/room/FEED");
+    sockets = [];
+    createSocket = (roomCode) => {
+      const sock = new FakeRoomSocket(roomCode);
+      sockets.push(sock);
+      return sock;
+    };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderActiveRound(now = Date.now()) {
+    render(<App createSocket={createSocket} />);
+    const sock = sockets[0]!;
+    act(() => {
+      sock.emitOpen();
+      sock.emitServerMessage({
+        type: "room_snapshot",
+        roomCode: "FEED",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_ACTIVE",
+        round: 1,
+        totalRounds: 2,
+        selfPlayerId: "p1",
+        playerToken: "tok-alice",
+        serverNow: now,
+        phaseEndsAt: now + 120_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 50,
+          },
+        ],
+        feed: [],
+      });
+    });
+    return { sock, now };
+  }
+
+  it("shows judging loader on submit & echoed plea, ignores rival Doom updates, and renders verdict + rail delta on matching doom_updated", async () => {
+    const user = userEvent.setup();
+    const { sock, now } = renderActiveRound();
+
+    expect(screen.queryByTestId("judge-status-indicator")).not.toBeInTheDocument();
+
+    const input = screen.getByPlaceholderText(/plead for your life/i);
+    await user.type(input, "Bob is hiding everything!");
+    await user.click(screen.getByRole("button", { name: /^Send$/i }));
+
+    // Optimistic judging indicator appears immediately without locking the input
+    const indicator = screen.getByTestId("judge-status-indicator");
+    expect(indicator).toHaveAttribute("data-status", "judging");
+    expect(indicator).toHaveTextContent("The Entity is judging your plea...");
+    expect(screen.getByTestId("judge-spinner")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-player-p1")).toHaveAttribute(
+      "data-judging",
+      "true",
+    );
+    expect(input).not.toBeDisabled();
+
+    // Server echoes Alice's chat message with pendingJudge: true
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m1",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "Bob is hiding everything!",
+        timestamp: now + 200,
+        pendingJudge: true,
+      });
+    });
+
+    expect(screen.getByTestId("msg-judge-pending-m1")).toHaveTextContent(
+      "Weighing plea...",
+    );
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+
+    // Another player's plea resolves first and also affects Alice's Doom -> flashes rail deltas but MUST NOT clear Alice's pending state
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m2",
+        playerId: "p2",
+        playerName: "Bob",
+        avatarId: "raven",
+        text: "No, watch Alice!",
+        timestamp: now + 300,
+        pendingJudge: true,
+      });
+      sock.emitServerMessage({
+        type: "doom_updated",
+        sourceMessageId: "m2",
+        updates: [
+          { playerId: "p2", doom: 45, delta: -5 },
+          { playerId: "p1", doom: 55, delta: 5 },
+        ],
+      });
+    });
+
+    expect(screen.getByTestId("rail-doom-delta-p2")).toHaveTextContent("-5%");
+    expect(screen.getByTestId("rail-doom-delta-p1")).toHaveTextContent("+5%");
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+    expect(screen.getByTestId("msg-judge-pending-m1")).toBeInTheDocument();
+
+    // Now Alice's m1 verdict arrives
+    act(() => {
+      sock.emitServerMessage({
+        type: "doom_updated",
+        sourceMessageId: "m1",
+        updates: [
+          { playerId: "p1", doom: 43, delta: -12 },
+          { playerId: "p2", doom: 55, delta: 10 },
+        ],
+      });
+    });
+
+    expect(screen.queryByTestId("judge-spinner")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("msg-judge-pending-m1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("rail-player-p1")).not.toHaveAttribute(
+      "data-judging",
+      "true",
+    );
+
+    const completedIndicator = screen.getByTestId("judge-status-indicator");
+    expect(completedIndicator).toHaveAttribute("data-status", "completed");
+    expect(completedIndicator).toHaveTextContent(
+      "▼ Verdict in — Doom -12% (now 43%)",
+    );
+
+    const msgVerdict = screen.getByTestId("msg-judge-verdict-m1");
+    expect(msgVerdict).toHaveTextContent("▼ -12% Doom");
+    expect(msgVerdict).toHaveTextContent("Bob +10%");
+
+    expect(screen.getByTestId("rail-doom-delta-p1")).toHaveTextContent("-12%");
+    expect(screen.getByTestId("rail-doom-delta-p2")).toHaveTextContent("+10%");
+    expect(screen.getByTestId("rail-player-p1")).toHaveTextContent("43%");
+    expect(screen.getByTestId("rail-player-p2")).toHaveTextContent("55%");
+  });
+
+  it("displays positive and zero-delta completion feedback clearly", () => {
+    vi.useFakeTimers();
+    const { sock, now } = renderActiveRound(Date.now());
+    const input = screen.getByPlaceholderText(/plead for your life/i);
+
+    // 1. Positive delta (+8%)
+    fireEvent.change(input, { target: { value: "aaaa" } });
+    fireEvent.submit(input.closest("form")!);
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m-pos",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "aaaa",
+        timestamp: now + 100,
+        pendingJudge: true,
+      });
+      sock.emitServerMessage({
+        type: "doom_updated",
+        sourceMessageId: "m-pos",
+        updates: [{ playerId: "p1", doom: 58, delta: 8 }],
+      });
+    });
+
+    expect(screen.getByTestId("judge-status-indicator")).toHaveTextContent(
+      "▲ Verdict in — Doom +8% (now 58%)",
+    );
+    expect(screen.getByTestId("msg-judge-verdict-m-pos")).toHaveTextContent(
+      "▲ +8% Doom",
+    );
+    expect(screen.getByTestId("rail-doom-delta-p1")).toHaveTextContent("+8%");
+
+    // Advance past 2.5s cooldown (within 12s timeout) and submit neutral plea (0% delta)
+    act(() => {
+      vi.advanceTimersByTime(2_600);
+    });
+    fireEvent.change(input, { target: { value: "Spare my soul tonight." } });
+    fireEvent.submit(input.closest("form")!);
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m-zero",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "Spare my soul tonight.",
+        timestamp: now + 2_800,
+        pendingJudge: true,
+      });
+      sock.emitServerMessage({
+        type: "doom_updated",
+        sourceMessageId: "m-zero",
+        updates: [{ playerId: "p1", doom: 58, delta: 0 }],
+      });
+    });
+
+    expect(screen.getByTestId("judge-status-indicator")).toHaveTextContent(
+      "✓ Verdict in — Doom unchanged (58%)",
+    );
+    expect(screen.getByTestId("msg-judge-verdict-m-zero")).toHaveTextContent(
+      "✓ 0% Doom",
+    );
+    expect(screen.getByTestId("rail-doom-delta-p1")).toHaveTextContent("0%");
+  });
+
+  it("handles whispers, server errors, pendingJudge: false, overlapping pleas, and phase transitions cleanly", async () => {
+    vi.useFakeTimers();
+    const { sock, now } = renderActiveRound(Date.now());
+    const input = screen.getByPlaceholderText(/plead for your life/i);
+
+    // 1. Whispers must NOT trigger judge-status-indicator
+    fireEvent.click(screen.getByTestId("rail-player-p2"));
+    fireEvent.change(
+      screen.getByPlaceholderText(/Whisper secretly to Bob/i),
+      { target: { value: "Stay quiet" } },
+    );
+    fireEvent.submit(
+      screen.getByPlaceholderText(/Whisper secretly to Bob/i).closest("form")!,
+    );
+    expect(sock.sent).toContainEqual({
+      type: "send_whisper",
+      targetPlayerId: "p2",
+      text: "Stay quiet",
+    });
+    expect(screen.queryByTestId("judge-status-indicator")).not.toBeInTheDocument();
+
+    // 2. Server error clears optimistic judging state
+    fireEvent.change(input, { target: { value: "Hear my plea" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+    act(() => {
+      sock.emitServerMessage({
+        type: "error",
+        code: "COOLDOWN_ACTIVE",
+        message: "Wait before pleading again.",
+      });
+    });
+    expect(screen.queryByTestId("judge-status-indicator")).not.toBeInTheDocument();
+
+    // 3. pendingJudge: false clears optimistic judging state on echo without pending badge
+    act(() => {
+      vi.advanceTimersByTime(2_600);
+    });
+    fireEvent.change(input, { target: { value: "Local echo only" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m-nojev",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "Local echo only",
+        timestamp: now + 2_700,
+        pendingJudge: false,
+      });
+    });
+    expect(screen.queryByTestId("judge-status-indicator")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("msg-judge-pending-m-nojev"),
+    ).not.toBeInTheDocument();
+
+    // 4. Overlapping pleas stay in judging until all resolve, and survive ROUND_RESOLVING until SACRIFICE_REVEAL
+    act(() => {
+      vi.advanceTimersByTime(2_600);
+    });
+    fireEvent.change(input, { target: { value: "First overlapping plea" } });
+    fireEvent.submit(input.closest("form")!);
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m-ov1",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "First overlapping plea",
+        timestamp: now + 5_400,
+        pendingJudge: true,
+      });
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(2_600);
+    });
+    fireEvent.change(input, { target: { value: "Second overlapping plea" } });
+    fireEvent.submit(input.closest("form")!);
+    act(() => {
+      sock.emitServerMessage({
+        type: "chat_message",
+        id: "m-ov2",
+        playerId: "p1",
+        playerName: "Alice",
+        avatarId: "skull",
+        text: "Second overlapping plea",
+        timestamp: now + 8_100,
+        pendingJudge: true,
+      });
+    });
+
+    expect(screen.getByTestId("judge-status-indicator")).toHaveTextContent(
+      "The Entity is judging 2 pleas...",
+    );
+
+    // Resolve first plea only -> second plea keeps indicator in judging
+    act(() => {
+      sock.emitServerMessage({
+        type: "doom_updated",
+        sourceMessageId: "m-ov1",
+        updates: [{ playerId: "p1", doom: 46, delta: -4 }],
+      });
+    });
+    expect(screen.getByTestId("msg-judge-verdict-m-ov1")).toHaveTextContent(
+      "▼ -4% Doom",
+    );
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+    expect(screen.getByTestId("judge-status-indicator")).toHaveTextContent(
+      "The Entity is judging your plea...",
+    );
+
+    // Transition to ROUND_RESOLVING keeps in-flight m-ov2 pending
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_RESOLVING",
+        round: 1,
+        totalRounds: 2,
+        serverNow: now + 120_000,
+        phaseEndsAt: now + 123_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 46,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: true,
+            doom: 50,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 50,
+          },
+        ],
+      });
+    });
+
+    expect(screen.getByTestId("msg-judge-pending-m-ov2")).toBeInTheDocument();
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "judging",
+    );
+
+    // Transition to SACRIFICE_REVEAL clears stale pending loaders
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "IN_MATCH",
+        matchPhase: "SACRIFICE_REVEAL",
+        round: 1,
+        totalRounds: 2,
+        serverNow: now + 123_000,
+        phaseEndsAt: now + 127_500,
+        sacrificedPlayerId: "p2",
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 46,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: false,
+            doom: 100,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 50,
+          },
+        ],
+      });
+    });
+
+    expect(
+      screen.queryByTestId("msg-judge-pending-m-ov2"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("judge-spinner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("judge-status-indicator")).toHaveAttribute(
+      "data-status",
+      "completed",
+    );
+
+    // Transition to Round 2 ROUND_INTRO clears lastSelfVerdict banner too
+    act(() => {
+      sock.emitServerMessage({
+        type: "phase_changed",
+        phase: "IN_MATCH",
+        matchPhase: "ROUND_INTRO",
+        round: 2,
+        totalRounds: 2,
+        serverNow: now + 127_500,
+        phaseEndsAt: now + 131_000,
+        players: [
+          {
+            id: "p1",
+            name: "Alice",
+            avatarId: "skull",
+            isHost: true,
+            connected: true,
+            joinedAt: now,
+            alive: true,
+            doom: 48,
+          },
+          {
+            id: "p2",
+            name: "Bob",
+            avatarId: "raven",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 100,
+            alive: false,
+            doom: 100,
+          },
+          {
+            id: "p3",
+            name: "Cara",
+            avatarId: "moth",
+            isHost: false,
+            connected: true,
+            joinedAt: now + 200,
+            alive: true,
+            doom: 50,
+          },
+        ],
+      });
+    });
+
+    expect(
+      screen.queryByTestId("judge-status-indicator"),
+    ).not.toBeInTheDocument();
+  });
+});
